@@ -1,0 +1,30 @@
+# Core — managed via conda (see /workspace/activate_env.sh)
+torch==2.1.0
+mmdet3d==1.3.0
+mmcv==2.1.0
+mmdet==3.2.0
+
+# Dataset
+nuscenes-devkit>=1.1.0
+numpy<1.24
+
+# Quantization
+pytorch-quantization>=2.1.2     # NVIDIA fake-quant for QAT
+
+# Pruning
+torch-pruning>=1.3.0
+
+# Experiment tracking
+mlflow>=2.17.0
+
+# Visualisation
+matplotlib>=3.7
+seaborn>=0.12
+
+# ONNX
+onnx>=1.17.0
+onnxruntime>=1.16.0
+
+# Utilities
+tqdm
+rich

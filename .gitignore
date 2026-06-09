@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Checkpoints & large data
+*.pth
+*.pkl
+*.bin
+*.onnx
+*.engine
+*.trt
+data/
+
+# MLflow
+mlruns/
+
+# Results (tracked separately)
+baseline/results/*.json
+compression/results/
+deployment/benchmarks/results/
+
+# C++ build artefacts
+deployment/build/
+*.o
+*.a
+*.so
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/

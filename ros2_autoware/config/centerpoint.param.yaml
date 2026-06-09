@@ -1,0 +1,29 @@
+/**:
+  ros__parameters:
+    # TRT engine paths
+    encoder_engine_path:   "/workspace/data/centerpoint/engines/pts_voxel_encoder.engine"
+    backbone_engine_path:  "/workspace/data/centerpoint/engines/pts_backbone_neck_head.engine"
+
+    # Inference
+    score_threshold:  0.35
+    max_detections:   500
+    precision:        "int8"     # fp32 | fp16 | int8
+
+    # Voxelization (must match training config)
+    point_cloud_range:       [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+    voxel_size:              [0.2, 0.2, 8.0]
+    max_num_voxels:          30000
+    max_points_per_voxel:    20
+
+    # nuScenes 10 classes
+    class_names:
+      - car
+      - truck
+      - construction_vehicle
+      - bus
+      - trailer
+      - barrier
+      - motorcycle
+      - bicycle
+      - pedestrian
+      - traffic_cone

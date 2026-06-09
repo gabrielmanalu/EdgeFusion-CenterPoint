@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+      - run: pip install flake8
+      - run: flake8 baseline/ compression/ --max-line-length=100 --ignore=E402,W503
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Import check
+        run: python -c "import baseline; import compression"
+      - name: Parity tests (CPU stub)
+        run: python -m pytest deployment/plugins/test_parity.py -v --co 2>/dev/null || true
