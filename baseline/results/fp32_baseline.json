@@ -1,0 +1,23 @@
+{
+  "checkpoint": "centerpoint_02pillar_second_secfpn_circlenms_4x8_cyclic_20e_nus_20220811_031844-191a3822.pth",
+  "config": "centerpoint_pillar02_second_secfpn_head-circlenms_8xb4-cyclic-20e_nus-3d.py",
+  "mAP": 0.4815,
+  "NDS": 0.5922,
+  "mATE": 0.3248,
+  "mASE": 0.263,
+  "mAOE": 0.3566,
+  "mAVE": 0.3453,
+  "mAAE": 0.1965,
+  "per_class": {
+    "car": 0.835,
+    "truck": 0.483,
+    "bus": 0.603,
+    "trailer": 0.326,
+    "construction_vehicle": 0.105,
+    "pedestrian": 0.762,
+    "motorcycle": 0.42,
+    "bicycle": 0.152,
+    "traffic_cone": 0.533,
+    "barrier": 0.596
+  }
+}

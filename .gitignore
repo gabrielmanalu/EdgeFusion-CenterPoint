@@ -18,7 +18,6 @@ data/
 mlruns/
 
 # Results (tracked separately)
-baseline/results/*.json
 compression/results/
 deployment/benchmarks/results/
 

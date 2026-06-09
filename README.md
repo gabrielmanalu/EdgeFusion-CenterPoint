@@ -19,15 +19,15 @@ nuScenes LiDAR ──► Pillar Encoder ──► 2D Backbone + SecFPN ──►
 
 ## Stack
 
-| Component | Version |
-|---|---|
-| PyTorch | 2.1.0 + cu118 |
-| mmdetection3d | 1.3.0 (autowarefoundation fork) |
-| TensorRT | 8.x |
-| ROS 2 | Humble |
-| CUDA | 11.8 |
-| Hardware — cloud | NVIDIA A40 48 GB |
-| Hardware — edge | Jetson Orin Nano Super 8 GB |
+| Component        | Version                         |
+| ---------------- | ------------------------------- |
+| PyTorch          | 2.1.0 + cu118                   |
+| mmdetection3d    | 1.3.0 (autowarefoundation fork) |
+| TensorRT         | 8.x                             |
+| ROS 2            | Humble                          |
+| CUDA             | 11.8                            |
+| Hardware — cloud | NVIDIA A40 48 GB                |
+| Hardware — edge  | Jetson Orin Nano Super 8 GB     |
 
 ---
 
@@ -35,21 +35,21 @@ nuScenes LiDAR ──► Pillar Encoder ──► 2D Backbone + SecFPN ──►
 
 ### Accuracy — nuScenes val
 
-| Variant | mAP | NDS |
-|---|---|---|
-| FP32 baseline | — | — |
-| PTQ INT8 | — | — |
-| QAT INT8 | — | — |
-| Pruned + QAT | — | — |
-| Distilled | — | — |
+| Variant       | mAP       | NDS       |
+| ------------- | --------- | --------- |
+| FP32 baseline | **48.15** | **59.22** |
+| PTQ INT8      | —         | —         |
+| QAT INT8      | —         | —         |
+| Pruned + QAT  | —         | —         |
+| Distilled     | —         | —         |
 
 ### Edge performance — Jetson Orin Nano (15 W)
 
-| Variant | FPS | p99 (ms) | Power (W) | mJ/frame |
-|---|---|---|---|---|
-| FP32 | — | — | — | — |
-| QAT INT8 | — | — | — | — |
-| Operating point | — | — | — | — |
+| Variant         | FPS | p99 (ms) | Power (W) | mJ/frame |
+| --------------- | --- | -------- | --------- | -------- |
+| FP32            | —   | —        | —         | —        |
+| QAT INT8        | —   | —        | —         | —        |
+| Operating point | —   | —        | —         | —        |
 
 ---
 
@@ -68,19 +68,34 @@ configs/            project-level config wrappers
 
 ## Quick start
 
+### Environment
+
 ```bash
-# 1. Activate the conda environment (A40 cloud pod)
-source /workspace/activate_env.sh
+# conda env is managed on the training pod — see requirements.txt
+# activate with the env that has torch 2.1 + mmdet3d 1.3 installed
+conda activate autoware_cp
 
-# 2. FP32 baseline evaluation
-python baseline/eval.py \
-    --config configs/centerpoint_pillar02_circlenms_nus.py \
-    --checkpoint /workspace/data/centerpoint/centerpoint_nuscenes.pth
+# verify
+python -c "import torch, mmdet3d; print(torch.__version__, mmdet3d.__version__)"
+```
 
-# 3. Compression sweep
-python compression/ptq.py --config ... --checkpoint ...
+### Eval FP32 baseline
+
+```bash
+cd /workspace/mmdetection3d
+python tools/test.py \
+    configs/centerpoint/centerpoint_pillar02_second_secfpn_head-circlenms_8xb4-cyclic-20e_nus-3d.py \
+    /workspace/data/centerpoint/centerpoint_02pillar_second_secfpn_circlenms_4x8_cyclic_20e_nus_20220811_031844-191a3822.pth \
+    --task lidar_det
+# mAP: 0.4815   NDS: 0.5922
+```
+
+### Compression sweep
+
+```bash
+python compression/ptq.py        --config ... --checkpoint ...
 python compression/sensitivity.py --config ... --checkpoint ...
-python compression/qat.py --config ... --checkpoint ... --sensitivity ...
+python compression/qat.py         --config ... --checkpoint ... --sensitivity ...
 ```
 
 ---
