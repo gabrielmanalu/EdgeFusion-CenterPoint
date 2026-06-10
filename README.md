@@ -19,15 +19,15 @@ nuScenes LiDAR ──► Pillar Encoder ──► 2D Backbone + SecFPN ──►
 
 ## Stack
 
-| Component        | Version                         |
-| ---------------- | ------------------------------- |
-| PyTorch          | 2.1.0 + cu118                   |
-| mmdetection3d    | 1.3.0 (autowarefoundation fork) |
-| TensorRT         | 8.x                             |
-| ROS 2            | Humble                          |
-| CUDA             | 12.8                            |
-| Hardware — cloud | NVIDIA A40 48 GB                |
-| Hardware — edge  | Jetson Orin Nano Super 8 GB     |
+| Component | Version |
+|---|---|
+| PyTorch | 2.1.0 + cu118 |
+| mmdetection3d | 1.3.0 (autowarefoundation fork) |
+| TensorRT | 8.x |
+| ROS 2 | Humble |
+| CUDA | 12.8 |
+| Hardware — cloud | NVIDIA A40 48 GB |
+| Hardware — edge | Jetson Orin Nano Super 8 GB |
 
 ---
 
@@ -35,21 +35,21 @@ nuScenes LiDAR ──► Pillar Encoder ──► 2D Backbone + SecFPN ──►
 
 ### Accuracy — nuScenes val
 
-| Variant       | mAP       | NDS       |
-| ------------- | --------- | --------- |
+| Variant | mAP | NDS |
+|---|---|---|
 | FP32 baseline | **48.15** | **59.22** |
-| PTQ INT8      | —         | —         |
-| QAT INT8      | —         | —         |
-| Pruned + QAT  | —         | —         |
-| Distilled     | —         | —         |
+| PTQ INT8 | **48.20** | **59.18** |
+| QAT INT8 | — | — |
+| Pruned + QAT | — | — |
+| Distilled | — | — |
 
 ### Edge performance — Jetson Orin Nano (15 W)
 
-| Variant         | FPS | p99 (ms) | Power (W) | mJ/frame |
-| --------------- | --- | -------- | --------- | -------- |
-| FP32            | —   | —        | —         | —        |
-| QAT INT8        | —   | —        | —         | —        |
-| Operating point | —   | —        | —         | —        |
+| Variant | FPS | p99 (ms) | Power (W) | mJ/frame |
+|---|---|---|---|---|
+| FP32 | — | — | — | — |
+| QAT INT8 | — | — | — | — |
+| Operating point | — | — | — | — |
 
 ---
 
@@ -71,11 +71,13 @@ configs/            project-level config wrappers
 ### Environment
 
 ```bash
-# conda env is managed on the training pod — see requirements.txt
-# activate with the env that has torch 2.1 + mmdet3d 1.3 installed
-conda activate autoware_cp
+# First-time setup on a new pod (installs miniconda, conda env, all packages)
+bash script/setup_env.sh
 
-# verify
+# Subsequent sessions — activate the existing env
+source /workspace/activate_env.sh
+
+# Verify
 python -c "import torch, mmdet3d; print(torch.__version__, mmdet3d.__version__)"
 ```
 
