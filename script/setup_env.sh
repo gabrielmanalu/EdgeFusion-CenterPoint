@@ -27,16 +27,24 @@ fi
 source "$CONDA_DIR/etc/profile.d/conda.sh"
 echo "Miniconda ready."
 
+# ── Accept Anaconda ToS (required on fresh installs) ─────────────────────────
+echo "[1b/7] Accepting Anaconda channel Terms of Service..."
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+
 # ── 2. Python 3.8 env ────────────────────────────────────────────────────────
 echo "[2/7] Creating conda env: $ENV_NAME (Python 3.8)..."
 conda create -n "$ENV_NAME" python=3.8 -y
+source "$CONDA_DIR/etc/profile.d/conda.sh"
 conda activate "$ENV_NAME"
+PIP="$CONDA_DIR/envs/$ENV_NAME/bin/pip"
+PYTHON="$CONDA_DIR/envs/$ENV_NAME/bin/python"
 
 # ── 3. PyTorch 2.1.0 + CUDA 11.8 ─────────────────────────────────────────────
 # cu118 is used deliberately: matches the mmcv/mmdet3d stack.
 # System CUDA 12.8 runtime is backward-compatible for GPU ops.
 echo "[3/7] Installing PyTorch 2.1.0+cu118..."
-pip install torch==2.1.0+cu118 torchvision==0.16.0+cu118 \
+$PIP install torch==2.1.0+cu118 torchvision==0.16.0+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
 
 # ── 4. mmcv 2.1.0 ─────────────────────────────────────────────────────────────
@@ -44,11 +52,11 @@ pip install torch==2.1.0+cu118 torchvision==0.16.0+cu118 \
 # Use plain `pip install mmcv` which builds from PyPI source.
 # mmcv must be <2.2.0 for mmdet 3.2.0 compatibility.
 echo "[4/7] Installing mmcv 2.1.0 (source build — ~20-40 min)..."
-pip install mmcv==2.1.0
+$PIP install mmcv==2.1.0
 
 # ── 5. mmdet 3.2.0 ────────────────────────────────────────────────────────────
 echo "[5/7] Installing mmdet 3.2.0..."
-pip install mmdet==3.2.0
+$PIP install mmdet==3.2.0
 
 # ── 6. mmdetection3d 1.3.0 (autowarefoundation fork) ─────────────────────────
 echo "[6/7] Cloning + installing autowarefoundation/mmdetection3d..."
@@ -57,11 +65,11 @@ if [ ! -d "$MMDET3D_DIR" ]; then
         "$MMDET3D_DIR"
 fi
 cd "$MMDET3D_DIR"
-pip install -e . --no-deps
+$PIP install -e . --no-deps
 
 # ── 7. Remaining packages ─────────────────────────────────────────────────────
 echo "[7/7] Installing remaining packages..."
-pip install \
+$PIP install \
     onnx==1.17.0 \
     onnxruntime==1.19.2 \
     mlflow==2.17.0 \
@@ -73,10 +81,10 @@ pip install \
     open3d
 
 # ── activate_env.sh ───────────────────────────────────────────────────────────
-cat > "$WORKSPACE/activate_env.sh" << 'EOF'
+cat > "$WORKSPACE/activate_env.sh" << 'ENVEOF'
 source /workspace/miniconda3/etc/profile.d/conda.sh
 conda activate autoware_cp
-EOF
+ENVEOF
 echo "activate_env.sh written to $WORKSPACE/activate_env.sh"
 
 # ── data symlink (after nuScenes is extracted to /data/nuscenes/) ─────────────
@@ -90,4 +98,3 @@ echo "  2. Download + extract nuScenes to /data/nuscenes/"
 echo "  3. ln -s /data/nuscenes $MMDET3D_DIR/data/nuscenes"
 echo "  4. Restore checkpoints + pkl files to /workspace/data/centerpoint/"
 echo "  5. Verify: python -c 'import mmdet3d; print(mmdet3d.__version__)'"
-echo "========================================"
