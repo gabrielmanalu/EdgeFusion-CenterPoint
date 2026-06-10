@@ -21,6 +21,7 @@ Usage (run from /workspace/mmdetection3d):
 """
 
 import argparse
+import copy
 import json
 from pathlib import Path
 from typing import Tuple
@@ -54,7 +55,9 @@ FP32 = {'mAP': 0.4815, 'NDS': 0.5922}
 
 def build_calib_loader(cfg: Config):
     """DataLoader over nuScenes train set using the test (no-aug) pipeline."""
-    calib_cfg = cfg.copy()
+    calib_cfg = copy.deepcopy(cfg)   # deepcopy — cfg.copy() is shallow and
+    # leaks the ann_file override back into the original cfg, causing evaluation
+    # to run on the train set instead of the val set.
     calib_cfg.test_dataloader.dataset.ann_file = 'nuscenes_infos_train.pkl'
     calib_cfg.test_dataloader.batch_size = 1
     calib_cfg.test_dataloader.num_workers = 2
@@ -179,6 +182,9 @@ def evaluate_ptq(model: torch.nn.Module, cfg: Config) -> dict:
     """Evaluate on nuScenes val with FakeQuantize active (simulated INT8)."""
     test_loader = Runner.build_dataloader(cfg.test_dataloader)
     evaluator = MMEval(cfg.test_evaluator)
+    # Propagate dataset class metadata — Runner normally does this;
+    # we must do it manually when calling the evaluator standalone.
+    evaluator.dataset_meta = test_loader.dataset.metainfo
     model.eval()
     with torch.no_grad():
         for batch in tqdm(test_loader, desc='Evaluating PTQ (fake-quant)'):
