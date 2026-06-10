@@ -25,15 +25,26 @@ import json
 from pathlib import Path
 from typing import Tuple
 
+import warnings
+
 import mlflow
 import torch
+import torch.fx
 from mmdet3d.apis import init_model
 from mmengine.config import Config
 from mmengine.evaluator import Evaluator as MMEval
 from mmengine.runner import Runner
-from torch.ao.quantization import get_default_qconfig_mapping
+from torch.ao.quantization import (
+    QConfig,
+    HistogramObserver,
+    PerChannelMinMaxObserver,
+    QConfigMapping,
+)
 from torch.ao.quantization.quantize_fx import prepare_fx
 from tqdm import tqdm
+
+# Suppress reduce_range deprecation — use explicit quant_min/quant_max instead
+warnings.filterwarnings('ignore', message='Please use quant_min and quant_max')
 
 RESULTS_DIR = Path(__file__).parent / 'results' / 'ptq'
 MAP_KEY = 'NuScenes metric/pred_instances_3d_NuScenes/mAP'
@@ -71,16 +82,35 @@ def compute_bev_features(
     return bev
 
 
+def _build_qconfig_mapping() -> QConfigMapping:
+    """TRT-compatible INT8 qconfig: symmetric per-channel weights, per-tensor acts."""
+    qconfig = QConfig(
+        activation=HistogramObserver.with_args(
+            quant_min=-128, quant_max=127,
+            dtype=torch.qint8,
+            qscheme=torch.per_tensor_symmetric,
+        ),
+        weight=PerChannelMinMaxObserver.with_args(
+            quant_min=-128, quant_max=127,
+            dtype=torch.qint8,
+            qscheme=torch.per_channel_symmetric,
+        ),
+    )
+    mapping = QConfigMapping()
+    mapping.set_global(qconfig)
+    return mapping
+
+
 def prepare_model_for_ptq(
     model: torch.nn.Module, bev_example: torch.Tensor
 ) -> Tuple[bool, bool]:
     """Insert FakeQuantize nodes into backbone and neck via torch.ao FX.
 
     FakeQuantize simulates INT8 precision on GPU in FP32 tensors — no actual
-    INT8 conversion until convert_fx (which we defer to the TRT export in P3).
+    INT8 conversion until convert_fx (deferred to TRT export in P3).
     Returns (backbone_quantized, neck_quantized).
     """
-    qconfig_mapping = get_default_qconfig_mapping('x86')
+    qconfig_mapping = _build_qconfig_mapping()
     backbone_ok = neck_ok = False
 
     # pts_backbone: SECOND — Conv2d + BN + ReLU blocks
@@ -96,8 +126,10 @@ def prepare_model_for_ptq(
         print(f'[PTQ] pts_backbone FX tracing failed ({exc}) — kept FP32')
 
     # pts_neck: SECONDFPN — ConvTranspose2d upsampling + concat
+    # SECONDFPN.forward() calls len() on the input tuple — FX needs a hint
     if backbone_ok:
         try:
+            torch.fx.wrap('len')   # allow len() in symbolic tracing
             with torch.no_grad():
                 neck_example = model.pts_backbone(bev_example)
             model.pts_neck = prepare_fx(
