@@ -4,20 +4,24 @@ Per-layer quantization sensitivity analysis.
 For each FakeQuantize node in pts_backbone and pts_neck:
     1. Disable ALL fake-quant (model runs in FP32).
     2. Enable ONLY this node (single quantizer active).
-    3. Evaluate on a fast val subset (default 500 samples, ~70s per node).
-    4. Record mAP drop vs the FP32 reference on the same subset.
+    3. Compute training loss on n_samples (default 500, ~10s per node).
+    4. Record loss increase vs the FP32 reference on the same samples.
 
-Outputs sensitivity.json with per-node rankings.
+Training loss is used instead of mAP because NuScenesEval requires predictions
+for the complete val split — partial subsets fail its token-set assertion.
+Loss is a valid sensitivity proxy: it directly measures how much quantization
+noise hurts the model's ability to produce correct heatmap + regression outputs.
+
+Outputs sensitivity.json with per-node rankings and a sensitive_nodes list.
 QAT reads this file to keep sensitive nodes in FP16 (mixed precision).
 
-Estimate: ~40 nodes x 70s = ~50 min on A40.
+Estimate: ~40 nodes x 10s = ~7 min on A40.
 
 Usage (run from /workspace/mmdetection3d):
     CFG=configs/centerpoint/centerpoint_pillar02_second_secfpn_head-circlenms_8xb4-cyclic-20e_nus-3d.py
     python .../compression/sensitivity.py \
         --config  $CFG \
-        --ptq-ckpt .../compression/results/ptq/ptq_calibrated.pth \
-        --fast-samples 500
+        --ptq-ckpt .../compression/results/ptq/ptq_calibrated.pth
 """
 
 import argparse
@@ -31,7 +35,6 @@ import torch
 import torch.nn as nn
 from mmdet3d.apis import init_model
 from mmengine.config import Config
-from mmengine.evaluator import Evaluator as MMEval
 from mmengine.registry import init_default_scope
 from mmengine.runner import Runner
 from torch.ao.quantization import (
@@ -47,12 +50,10 @@ from tqdm import tqdm
 warnings.filterwarnings('ignore', message='Please use quant_min and quant_max')
 
 RESULTS_DIR = Path(__file__).parent / 'results' / 'sensitivity'
-MAP_KEY = 'NuScenes metric/pred_instances_3d_NuScenes/mAP'
-NDS_KEY = 'NuScenes metric/pred_instances_3d_NuScenes/NDS'
-FP32 = {'mAP': 0.4815, 'NDS': 0.5922}
 
-# Layers with drop above this threshold are flagged as sensitive
-SENSITIVITY_THRESHOLD = 0.005   # 0.5% mAP drop
+# Loss-based threshold: flag node as sensitive if loss increases by more
+# than this fraction of the FP32 reference loss.
+SENSITIVITY_THRESHOLD = 0.02   # 2% relative loss increase
 
 
 # ── Utilities (shared with ptq.py / qat.py) ───────────────────────────────────
@@ -160,87 +161,90 @@ def set_all_fake_quant(model: nn.Module, enabled: bool) -> None:
                 module.disable_fake_quant()
 
 
-def fast_eval(
-    model: nn.Module, loader, cfg: Config, n_samples: int
-) -> dict:
-    """Evaluate on the first n_samples of the val set.
+def build_train_loader(cfg: Config, batch_size: int = 1):
+    """Train loader without CBGSDataset — provides GT for loss computation."""
+    train_cfg = copy.deepcopy(cfg.train_dataloader)
+    if train_cfg.dataset.get('type') == 'CBGSDataset':
+        train_cfg.dataset = train_cfg.dataset.dataset
+    train_cfg.batch_size = batch_size
+    train_cfg.num_workers = 2
+    return Runner.build_dataloader(train_cfg)
 
-    mAP is lower than full eval but relative rankings between nodes are valid
-    since the same samples are used for every node.
+
+def compute_loss_proxy(
+    model: nn.Module, loader, n_samples: int
+) -> float:
+    """Mean training loss over n_samples as a sensitivity proxy.
+
+    Using loss instead of mAP avoids NuScenesEval's requirement for
+    predictions on the complete val split. Loss is computed in eval mode
+    (BN uses running stats) with no_grad for speed.
     """
-    evaluator = MMEval(cfg.test_evaluator)
-    evaluator.dataset_meta = loader.dataset.metainfo
     model.eval()
+    total = 0.0
+    count = 0
     with torch.no_grad():
         for i, batch in enumerate(loader):
             if i >= n_samples:
                 break
-            outputs = model.test_step(batch)
-            evaluator.process(data_batch=batch, data_samples=outputs)
-    return evaluator.evaluate(min(n_samples, len(loader.dataset)))
+            data = model.data_preprocessor(batch, True)
+            losses = model(**data, mode='loss')
+            total += sum(
+                v.item() for k, v in losses.items() if 'loss' in k.lower()
+            )
+            count += 1
+    return total / max(count, 1)
 
 
 # ── Main analysis ─────────────────────────────────────────────────────────────
 
 def run_sensitivity_analysis(
     model: nn.Module,
-    val_loader,
-    cfg: Config,
+    train_loader,
     n_samples: int,
+    threshold: float,
     out: Path,
 ) -> dict:
-    """Per-node sensitivity sweep.
-
-    For each FakeQuantize node: quantize only that node, measure mAP drop.
-    """
     fq_nodes = get_fake_quant_nodes(model)
-    print(f'[Sensitivity] Found {len(fq_nodes)} FakeQuantize nodes.')
+    print(f'[Sensitivity] {len(fq_nodes)} FakeQuantize nodes found.')
 
-    # FP32 reference on the same n_samples subset
-    print('[Sensitivity] Computing FP32 reference...')
+    print('[Sensitivity] Computing FP32 reference loss...')
     set_all_fake_quant(model, False)
-    ref_metrics = fast_eval(model, val_loader, cfg, n_samples)
-    ref_map = ref_metrics.get(MAP_KEY, 0.0)
-    ref_nds = ref_metrics.get(NDS_KEY, 0.0)
-    print(f'[Sensitivity] FP32 reference ({n_samples} samples): '
-          f'mAP {ref_map:.4f}  NDS {ref_nds:.4f}')
+    ref_loss = compute_loss_proxy(model, train_loader, n_samples)
+    print(f'[Sensitivity] FP32 reference loss: {ref_loss:.4f}')
 
     results = {}
     for node_name, fq_module in tqdm(fq_nodes.items(), desc='Sensitivity'):
-        # Quantize only this node
         set_all_fake_quant(model, False)
         fq_module.enable_fake_quant()
-
-        metrics = fast_eval(model, val_loader, cfg, n_samples)
-        node_map = metrics.get(MAP_KEY, 0.0)
-        drop = ref_map - node_map
-
+        node_loss = compute_loss_proxy(model, train_loader, n_samples)
+        abs_increase = node_loss - ref_loss
+        rel_increase = abs_increase / max(ref_loss, 1e-8)
         results[node_name] = {
-            'mAP': round(node_map, 4),
-            'mAP_drop': round(drop, 4),
-            'sensitive': drop > SENSITIVITY_THRESHOLD,
+            'loss': round(node_loss, 4),
+            'loss_increase': round(abs_increase, 4),
+            'rel_increase': round(rel_increase, 4),
+            'sensitive': rel_increase > threshold,
         }
 
-    # Re-enable all fake quant
     set_all_fake_quant(model, True)
 
-    # Sort by drop descending
     ranked = dict(sorted(
-        results.items(), key=lambda x: x[1]['mAP_drop'], reverse=True
+        results.items(), key=lambda x: x[1]['loss_increase'], reverse=True
     ))
 
     sensitive_nodes = [k for k, v in ranked.items() if v['sensitive']]
     print(f'\n[Sensitivity] Sensitive nodes '
-          f'(drop > {SENSITIVITY_THRESHOLD:.3f}): {len(sensitive_nodes)}')
+          f'(rel increase > {threshold:.2f}): {len(sensitive_nodes)}')
     for name in sensitive_nodes[:10]:
-        print(f'  {name:60s}  drop {ranked[name]["mAP_drop"]:.4f}')
+        v = ranked[name]
+        print(f'  {name:70s}  +{v["rel_increase"]:.3f}')
 
     output = {
-        'fp32_map_fast': round(ref_map, 4),
-        'fp32_nds_fast': round(ref_nds, 4),
-        'fp32_map_full': FP32['mAP'],
+        'metric': 'training_loss_proxy',
+        'fp32_ref_loss': round(ref_loss, 4),
         'n_samples': n_samples,
-        'sensitivity_threshold': SENSITIVITY_THRESHOLD,
+        'sensitivity_threshold': threshold,
         'sensitive_nodes': sensitive_nodes,
         'layers': ranked,
     }
@@ -257,12 +261,10 @@ def parse_args() -> argparse.Namespace:
         description='Per-layer sensitivity analysis for CenterPoint PTQ'
     )
     p.add_argument('--config', required=True)
-    p.add_argument('--ptq-ckpt', required=True,
-                   help='ptq_calibrated.pth from compression/ptq.py')
-    p.add_argument('--fast-samples', type=int, default=500,
-                   help='Val samples per node (default 500, ~70s/node)')
+    p.add_argument('--ptq-ckpt', required=True)
+    p.add_argument('--fast-samples', type=int, default=500)
     p.add_argument('--threshold', type=float, default=SENSITIVITY_THRESHOLD,
-                   help='mAP drop threshold to flag a node as sensitive')
+                   help='Relative loss increase threshold (default: 0.02)')
     p.add_argument('--out', default=str(RESULTS_DIR))
     return p.parse_args()
 
@@ -275,29 +277,28 @@ def main() -> None:
     cfg = Config.fromfile(args.config)
     init_default_scope(cfg.get('default_scope', 'mmdet3d'))
 
-    # One sample for BEV shape inference during FX tracing
-    sample_loader = Runner.build_dataloader(copy.deepcopy(cfg.test_dataloader))
-    sample_batch = next(iter(sample_loader))
+    # One val batch for BEV shape inference during FX tracing
+    val_loader = Runner.build_dataloader(copy.deepcopy(cfg.test_dataloader))
+    sample_batch = next(iter(val_loader))
 
     model = prepare_and_load_ptq_checkpoint(cfg, args.ptq_ckpt, sample_batch)
     print('[Sensitivity] Model prepared and PTQ checkpoint loaded.')
 
-    # Rebuild val loader (separate from sample_loader to reset iteration)
-    val_loader = Runner.build_dataloader(copy.deepcopy(cfg.test_dataloader))
+    train_loader = build_train_loader(cfg, batch_size=1)
 
     with mlflow.start_run(run_name=f'sensitivity_{args.fast_samples}samp'):
         mlflow.log_params({
-            'method': 'per_node_sensitivity',
+            'method': 'loss_proxy_sensitivity',
             'fast_samples': args.fast_samples,
             'threshold': args.threshold,
         })
 
         results = run_sensitivity_analysis(
-            model, val_loader, cfg, args.fast_samples, out
+            model, train_loader, args.fast_samples, args.threshold, out
         )
 
         mlflow.log_metrics({
-            'fp32_map_fast': results['fp32_map_fast'],
+            'fp32_ref_loss': results['fp32_ref_loss'],
             'n_sensitive_nodes': len(results['sensitive_nodes']),
         })
         mlflow.log_artifact(str(out / 'sensitivity.json'))
@@ -305,4 +306,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-    
