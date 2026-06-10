@@ -25,7 +25,7 @@ nuScenes LiDAR ──► Pillar Encoder ──► 2D Backbone + SecFPN ──►
 | mmdetection3d    | 1.3.0 (autowarefoundation fork) |
 | TensorRT         | 8.x                             |
 | ROS 2            | Humble                          |
-| CUDA             | 11.8                            |
+| CUDA             | 12.8                            |
 | Hardware — cloud | NVIDIA A40 48 GB                |
 | Hardware — edge  | Jetson Orin Nano Super 8 GB     |
 

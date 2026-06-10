@@ -125,20 +125,35 @@ def prepare_model_for_ptq(
     except Exception as exc:
         print(f'[PTQ] pts_backbone FX tracing failed ({exc}) — kept FP32')
 
-    # pts_neck: SECONDFPN — ConvTranspose2d upsampling + concat
-    # SECONDFPN.forward() calls len() on the input tuple — FX needs a hint
+    # pts_neck: SECONDFPN — ConvTranspose2d upsampling + concat.
+    # SECONDFPN.forward() calls len(x) on the backbone output tuple. FX
+    # cannot evaluate len() on a symbolic tensor. Fix: temporarily patch
+    # SECONDFPN.forward to use len(self.deblocks) — a Python constant — which
+    # is functionally identical and FX-traceable. The patch is restored in
+    # the finally block so the rest of the codebase is unaffected.
     if backbone_ok:
         try:
-            torch.fx.wrap('len')   # allow len() in symbolic tracing
-            with torch.no_grad():
-                neck_example = model.pts_backbone(bev_example)
-            model.pts_neck = prepare_fx(
-                model.pts_neck,
-                qconfig_mapping,
-                example_inputs=(neck_example,),
-            )
-            neck_ok = True
-            print('[PTQ] pts_neck: FakeQuantize nodes inserted')
+            from mmdet3d.models.necks.second_fpn import SECONDFPN as _SFPN
+            _orig_fwd = _SFPN.forward
+
+            def _traceable_fwd(self, x):
+                outs = [self.deblocks[i](x[i]) for i in range(len(self.deblocks))]
+                out = torch.cat(outs, dim=1) if len(self.deblocks) > 1 else outs[0]
+                return [out]
+
+            _SFPN.forward = _traceable_fwd
+            try:
+                with torch.no_grad():
+                    neck_example = model.pts_backbone(bev_example)
+                model.pts_neck = prepare_fx(
+                    model.pts_neck,
+                    qconfig_mapping,
+                    example_inputs=(neck_example,),
+                )
+                neck_ok = True
+                print('[PTQ] pts_neck: FakeQuantize nodes inserted')
+            finally:
+                _SFPN.forward = _orig_fwd   # always restore
         except Exception as exc:
             print(f'[PTQ] pts_neck FX tracing failed ({exc}) — kept FP32')
 
