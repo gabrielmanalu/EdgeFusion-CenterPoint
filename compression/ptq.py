@@ -36,12 +36,14 @@ from mmengine.config import Config
 from mmengine.evaluator import Evaluator as MMEval
 from mmengine.runner import Runner
 from torch.ao.quantization import (
+    FakeQuantize,
     QConfig,
     HistogramObserver,
     PerChannelMinMaxObserver,
     QConfigMapping,
 )
-from torch.ao.quantization.quantize_fx import prepare_fx
+from torch.ao.quantization.fake_quantize import FakeQuantizeBase
+from torch.ao.quantization.quantize_fx import prepare_qat_fx
 from tqdm import tqdm
 
 # Suppress reduce_range deprecation — use explicit quant_min/quant_max instead
@@ -86,14 +88,22 @@ def compute_bev_features(
 
 
 def _build_qconfig_mapping() -> QConfigMapping:
-    """TRT-compatible INT8 qconfig: symmetric per-channel weights, per-tensor acts."""
+    """TRT-compatible INT8 qconfig.
+
+    Must use FakeQuantize.with_args(observer=...) — prepare_qat_fx only inserts
+    FakeQuantize nodes when the QConfig explicitly specifies FakeQuantize.
+    Raw observer classes (HistogramObserver.with_args) produce observer nodes
+    that are invisible to the forward pass and give 0 FakeQuantize nodes.
+    """
     qconfig = QConfig(
-        activation=HistogramObserver.with_args(
+        activation=FakeQuantize.with_args(
+            observer=HistogramObserver,
             quant_min=-128, quant_max=127,
             dtype=torch.qint8,
             qscheme=torch.per_tensor_symmetric,
         ),
-        weight=PerChannelMinMaxObserver.with_args(
+        weight=FakeQuantize.with_args(
+            observer=PerChannelMinMaxObserver,
             quant_min=-128, quant_max=127,
             dtype=torch.qint8,
             qscheme=torch.per_channel_symmetric,
@@ -118,7 +128,7 @@ def prepare_model_for_ptq(
 
     # pts_backbone: SECOND — Conv2d + BN + ReLU blocks
     try:
-        model.pts_backbone = prepare_fx(
+        model.pts_backbone = prepare_qat_fx(
             model.pts_backbone,
             qconfig_mapping,
             example_inputs=(bev_example,),
@@ -148,7 +158,7 @@ def prepare_model_for_ptq(
             try:
                 with torch.no_grad():
                     neck_example = model.pts_backbone(bev_example)
-                model.pts_neck = prepare_fx(
+                model.pts_neck = prepare_qat_fx(
                     model.pts_neck,
                     qconfig_mapping,
                     example_inputs=(neck_example,),
@@ -163,10 +173,27 @@ def prepare_model_for_ptq(
     return backbone_ok, neck_ok
 
 
+def _set_calibration_mode(model: torch.nn.Module, calibrating: bool) -> None:
+    """Switch FakeQuantize nodes between calibration and eval modes.
+
+    Calibrating=True:  observers ON, fake-quant OFF  (collect statistics)
+    Calibrating=False: observers OFF, fake-quant ON   (simulate INT8)
+    """
+    for module in model.modules():
+        if isinstance(module, FakeQuantizeBase):
+            if calibrating:
+                module.enable_observer()
+                module.disable_fake_quant()
+            else:
+                module.disable_observer()
+                module.enable_fake_quant()
+
+
 def run_calibration(
     model: torch.nn.Module, loader, n_calib: int
 ) -> None:
-    """Run n_calib forward passes so FakeQuantize observers collect stats."""
+    """Collect activation statistics over n_calib samples, then lock scales."""
+    _set_calibration_mode(model, calibrating=True)
     model.eval()
     with torch.no_grad():
         for i, batch in enumerate(
@@ -175,6 +202,8 @@ def run_calibration(
             if i >= n_calib:
                 break
             model.test_step(batch)
+    # Lock scales: disable observers, enable fake-quant for INT8 simulation
+    _set_calibration_mode(model, calibrating=False)
     print(f'[PTQ] Calibration complete ({n_calib} samples).')
 
 

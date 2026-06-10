@@ -38,13 +38,14 @@ from mmengine.config import Config
 from mmengine.registry import init_default_scope
 from mmengine.runner import Runner
 from torch.ao.quantization import (
+    FakeQuantize,
     QConfig,
     HistogramObserver,
     PerChannelMinMaxObserver,
     QConfigMapping,
 )
 from torch.ao.quantization.fake_quantize import FakeQuantizeBase
-from torch.ao.quantization.quantize_fx import prepare_fx
+from torch.ao.quantization.quantize_fx import prepare_qat_fx
 from tqdm import tqdm
 
 warnings.filterwarnings('ignore', message='Please use quant_min and quant_max')
@@ -59,13 +60,16 @@ SENSITIVITY_THRESHOLD = 0.02   # 2% relative loss increase
 # ── Utilities (shared with ptq.py / qat.py) ───────────────────────────────────
 
 def _build_qconfig_mapping() -> QConfigMapping:
+    """Must use FakeQuantize.with_args — prepare_qat_fx needs FakeQuantize explicitly."""
     qconfig = QConfig(
-        activation=HistogramObserver.with_args(
+        activation=FakeQuantize.with_args(
+            observer=HistogramObserver,
             quant_min=-128, quant_max=127,
             dtype=torch.qint8,
             qscheme=torch.per_tensor_symmetric,
         ),
-        weight=PerChannelMinMaxObserver.with_args(
+        weight=FakeQuantize.with_args(
+            observer=PerChannelMinMaxObserver,
             quant_min=-128, quant_max=127,
             dtype=torch.qint8,
             qscheme=torch.per_channel_symmetric,
@@ -94,13 +98,10 @@ def compute_bev_features(model: nn.Module, voxel_dict: dict) -> torch.Tensor:
 
 
 def _apply_fx_preparation(model: nn.Module, bev_example: torch.Tensor) -> None:
-    """Insert FakeQuantize into backbone + neck (same as ptq.py / qat.py)."""
     qconfig_mapping = _build_qconfig_mapping()
-
-    model.pts_backbone = prepare_fx(
+    model.pts_backbone = prepare_qat_fx(
         model.pts_backbone, qconfig_mapping, example_inputs=(bev_example,)
     )
-
     from mmdet3d.models.necks.second_fpn import SECONDFPN as _SFPN
     _orig = _SFPN.forward
 
@@ -113,38 +114,57 @@ def _apply_fx_preparation(model: nn.Module, bev_example: torch.Tensor) -> None:
     try:
         with torch.no_grad():
             neck_ex = model.pts_backbone(bev_example)
-        model.pts_neck = prepare_fx(
+        model.pts_neck = prepare_qat_fx(
             model.pts_neck, qconfig_mapping, example_inputs=(neck_ex,)
         )
     finally:
         _SFPN.forward = _orig
 
 
-def prepare_and_load_ptq_checkpoint(
-    cfg: Config, ptq_ckpt: str, sample_batch: dict
-) -> nn.Module:
-    model = init_model(cfg, checkpoint=None, device='cuda:0')
-    model.eval()
+def _set_train_cfg(model: nn.Module, cfg: Config) -> None:
+    """Propagate top-level train_cfg to pts_bbox_head.
 
+    Inference configs store train_cfg at the top level (cfg.train_cfg),
+    not inside cfg.model. init_model builds the model without it, so
+    pts_bbox_head.train_cfg is None. This is required for mode='loss'.
+    """
+    if model.pts_bbox_head.train_cfg is not None:
+        return
+    top_train_cfg = cfg.get('train_cfg', None)
+    if top_train_cfg is None:
+        return
+    pts_cfg = (
+        top_train_cfg.get('pts', None)
+        if isinstance(top_train_cfg, dict)
+        else getattr(top_train_cfg, 'pts', None)
+    )
+    if pts_cfg is not None:
+        model.pts_bbox_head.train_cfg = pts_cfg
+
+
+def prepare_and_load_ptq_checkpoint(
+    cfg: Config, fp32_ckpt: str, ptq_ckpt: str, sample_batch: dict
+) -> nn.Module:
+    """Init from FP32 checkpoint (sets train_cfg), apply FX, load PTQ scales."""
+    # init_model with the real FP32 checkpoint ensures train_cfg is populated,
+    # which is required for mode='loss'. checkpoint=None skips this.
+    model = init_model(cfg, checkpoint=fp32_ckpt, device='cuda:0')
+    model.eval()
     voxel_dict = get_voxel_dict(model, sample_batch)
     bev_example = compute_bev_features(model, voxel_dict)
     _apply_fx_preparation(model, bev_example)
-
+    # Load PTQ calibrated FakeQuantize scales on top of FP32 weights
     ckpt = torch.load(ptq_ckpt, map_location='cuda:0')
     state_dict = ckpt.get('state_dict', ckpt)
-    try:
-        model.load_state_dict(state_dict, strict=True)
-    except RuntimeError as exc:
-        print(f'[Sensitivity] strict=True failed ({exc}); using strict=False')
-        model.load_state_dict(state_dict, strict=False)
-
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    print(f'[Sensitivity] PTQ scales loaded '
+          f'({len(missing)} missing, {len(unexpected)} unexpected keys)')
     return model
 
 
 # ── Sensitivity helpers ───────────────────────────────────────────────────────
 
 def get_fake_quant_nodes(model: nn.Module) -> dict:
-    """Return {name: module} for every FakeQuantize node in the model."""
     return {
         name: module
         for name, module in model.named_modules()
@@ -261,7 +281,10 @@ def parse_args() -> argparse.Namespace:
         description='Per-layer sensitivity analysis for CenterPoint PTQ'
     )
     p.add_argument('--config', required=True)
-    p.add_argument('--ptq-ckpt', required=True)
+    p.add_argument('--fp32-ckpt', required=True,
+                   help='Original FP32 .pth checkpoint (for model init + train_cfg)')
+    p.add_argument('--ptq-ckpt', required=True,
+                   help='ptq_calibrated.pth from compression/ptq.py')
     p.add_argument('--fast-samples', type=int, default=500)
     p.add_argument('--threshold', type=float, default=SENSITIVITY_THRESHOLD,
                    help='Relative loss increase threshold (default: 0.02)')
@@ -281,7 +304,9 @@ def main() -> None:
     val_loader = Runner.build_dataloader(copy.deepcopy(cfg.test_dataloader))
     sample_batch = next(iter(val_loader))
 
-    model = prepare_and_load_ptq_checkpoint(cfg, args.ptq_ckpt, sample_batch)
+    model = prepare_and_load_ptq_checkpoint(
+        cfg, args.fp32_ckpt, args.ptq_ckpt, sample_batch
+    )
     print('[Sensitivity] Model prepared and PTQ checkpoint loaded.')
 
     train_loader = build_train_loader(cfg, batch_size=1)
