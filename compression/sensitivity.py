@@ -32,6 +32,7 @@ import torch.nn as nn
 from mmdet3d.apis import init_model
 from mmengine.config import Config
 from mmengine.evaluator import Evaluator as MMEval
+from mmengine.registry import init_default_scope
 from mmengine.runner import Runner
 from torch.ao.quantization import (
     QConfig,
@@ -272,6 +273,7 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     cfg = Config.fromfile(args.config)
+    init_default_scope(cfg.get('default_scope', 'mmdet3d'))
 
     # One sample for BEV shape inference during FX tracing
     sample_loader = Runner.build_dataloader(copy.deepcopy(cfg.test_dataloader))
@@ -303,3 +305,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+    
