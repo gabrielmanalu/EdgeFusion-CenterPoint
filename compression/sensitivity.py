@@ -121,26 +121,43 @@ def _apply_fx_preparation(model: nn.Module, bev_example: torch.Tensor) -> None:
         _SFPN.forward = _orig
 
 
-def _set_train_cfg(model: nn.Module, cfg: Config) -> None:
-    """Propagate top-level train_cfg to pts_bbox_head.
 
-    Inference configs store train_cfg at the top level (cfg.train_cfg),
-    not inside cfg.model. init_model builds the model without it, so
-    pts_bbox_head.train_cfg is None. This is required for mode='loss'.
+def _set_train_cfg_from_config(model: nn.Module, cfg: Config) -> None:
+    """Construct pts_bbox_head.train_cfg from model config fields.
+
+    Inference configs don't define model.train_cfg. We reconstruct it from
+    fields that ARE always present: bbox_coder.out_size_factor, voxel_layer,
+    pts_middle_encoder.output_shape.
     """
     if model.pts_bbox_head.train_cfg is not None:
         return
-    top_train_cfg = cfg.get('train_cfg', None)
-    if top_train_cfg is None:
-        return
-    pts_cfg = (
-        top_train_cfg.get('pts', None)
-        if isinstance(top_train_cfg, dict)
-        else getattr(top_train_cfg, 'pts', None)
-    )
-    if pts_cfg is not None:
-        model.pts_bbox_head.train_cfg = pts_cfg
 
+    head_cfg = cfg.model.get('pts_bbox_head', {})
+    bbox_coder = head_cfg.get('bbox_coder', {})
+    voxel_layer = cfg.model.get('data_preprocessor', {}).get('voxel_layer', {})
+    scatter = cfg.model.get('pts_middle_encoder', {})
+
+    pc_range = list(voxel_layer.get(
+        'point_cloud_range', [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+    ))
+    voxel_size = list(voxel_layer.get('voxel_size', [0.2, 0.2, 8.0]))
+    out_size_factor = bbox_coder.get('out_size_factor', 4)
+    output_shape = scatter.get('output_shape', [512, 512])
+    grid_size = [output_shape[0], output_shape[1], 1]
+
+    model.pts_bbox_head.train_cfg = dict(
+        point_cloud_range=pc_range,
+        voxel_size=voxel_size,
+        grid_size=grid_size,
+        out_size_factor=out_size_factor,
+        dense_reg=1,
+        gaussian_overlap=0.1,
+        max_objs=500,
+        min_radius=2,
+        code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2],
+    )
+    print(f'[init] train_cfg set: out_size_factor={out_size_factor}, '
+          f'grid_size={grid_size}')
 
 def prepare_and_load_ptq_checkpoint(
     cfg: Config, fp32_ckpt: str, ptq_ckpt: str, sample_batch: dict
@@ -159,6 +176,7 @@ def prepare_and_load_ptq_checkpoint(
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(f'[Sensitivity] PTQ scales loaded '
           f'({len(missing)} missing, {len(unexpected)} unexpected keys)')
+    _set_train_cfg_from_config(model, cfg)
     return model
 
 

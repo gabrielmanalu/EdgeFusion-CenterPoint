@@ -38,7 +38,7 @@ nuScenes LiDAR ──► Pillar Encoder ──► 2D Backbone + SecFPN ──►
 | Variant | mAP | NDS |
 |---|---|---|
 | FP32 baseline | **48.15** | **59.22** |
-| PTQ INT8 | **48.20** | **59.18** |
+| PTQ INT8 | **48.12** | **59.03** |
 | QAT INT8 | — | — |
 | Pruned + QAT | — | — |
 | Distilled | — | — |
