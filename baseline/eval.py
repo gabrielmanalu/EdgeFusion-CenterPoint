@@ -38,21 +38,31 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_mmdet3d_test(config: str, checkpoint: str, out: str, gpu_id: str) -> dict:
-    """Delegate to mmdet3d tools/test.py and capture JSON results."""
+    """Delegate to mmdet3d tools/test.py and capture results."""
     cmd = [
         sys.executable,
         str(MMDET3D_ROOT / "tools" / "test.py"),
         config,
         checkpoint,
         "--task", "lidar_det",
-        "--out", out,
     ]
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu_id
-    subprocess.run(cmd, env=env, check=True)
+    result = subprocess.run(cmd, env=env, check=True, capture_output=True, text=True)
 
-    with open(out) as f:
-        return json.load(f)
+    # Parse mAP and NDS from stdout
+    metrics = {}
+    for line in result.stdout.splitlines():
+        if line.strip().startswith("mAP:"):
+            metrics["mAP"] = float(line.split(":")[1].strip())
+        elif line.strip().startswith("NDS:"):
+            metrics["NDS"] = float(line.split(":")[1].strip())
+
+    # Save parsed metrics
+    with open(out, "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    return metrics
 
 
 def main() -> None:

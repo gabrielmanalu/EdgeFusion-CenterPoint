@@ -87,14 +87,15 @@ python EdgeFusion-CenterPoint/compression/check_fakequant.py \
 
 ## Results Summary
 
-| Variant       | mAP   | NDS   | vs FP32         |
-| ------------- | ----- | ----- | --------------- |
-| FP32 baseline | 48.15 | 59.22 | —               |
-| PTQ INT8      | 48.12 | 59.03 | −0.03% / −0.19% |
-| QAT INT8      | TBD   | TBD   | TBD             |
+| Variant | mAP | NDS | vs FP32 |
+|---|---|---|---|
+| FP32 baseline | 48.15 | 59.22 | — |
+| PTQ INT8 | 48.12 | 59.03 | −0.03% / −0.19% |
+| QAT INT8 | **48.14** | **59.10** | −0.01% / −0.12% |
 
-PTQ achieves essentially free quantization — the drop is within evaluation variance.
-This is expected for a BatchNorm-heavy architecture (see Architecture Analysis below).
+QAT recovered +0.0002 mAP and +0.0007 NDS over PTQ — small refinements as expected
+when the architecture is already INT8-robust. The one marginally-sensitive layer
+(`blocks.0.3` weight) was kept in FP16 via mixed precision.
 
 ---
 
@@ -334,15 +335,15 @@ aggressive than Autoware's production default.
 
 Key parameter differences between Autoware's deployed model and ours:
 
-| Parameter                 | Autoware deployed           | This project         |
-| ------------------------- | --------------------------- | -------------------- |
-| `point_cloud_range` z     | −3.0 to +5.0                | −5.0 to +3.0         |
-| `voxel_size`              | [0.2, 0.2, 8.0]             | [0.2, 0.2, 8.0]      |
-| `point_feature_size`      | 4                           | 5                    |
-| `encoder_in_feature_size` | 9                           | 11                   |
-| `trt_precision`           | fp16                        | INT8 (Jetson target) |
-| Classes                   | 5                           | 10                   |
-| Training data             | nuScenes + TIER IV internal | nuScenes only        |
+| Parameter | Autoware deployed | This project |
+|---|---|---|
+| `point_cloud_range` z | −3.0 to +5.0 | −5.0 to +3.0 |
+| `voxel_size` | [0.2, 0.2, 8.0] | [0.2, 0.2, 8.0] |
+| `point_feature_size` | 4 | 5 |
+| `encoder_in_feature_size` | 9 | 11 |
+| `trt_precision` | fp16 | INT8 (Jetson target) |
+| Classes | 5 | 10 |
+| Training data | nuScenes + TIER IV internal | nuScenes only |
 
 The z-range difference reflects different sensor mounting heights between Autoware's test
 vehicle and the nuScenes vehicle. Our model is trained with the standard nuScenes range and

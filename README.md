@@ -103,7 +103,7 @@ EdgeFusion-CenterPoint/
 │   ├── distillation.py
 │   ├── pareto.py
 │   ├── check_fakequant.py
-│   ├── results/
+│   ├── results/           ← not in repo — see Checkpoints below
 │   └── README.md
 ├── docs/
 │   └── design_decisions.md
@@ -121,17 +121,15 @@ EdgeFusion-CenterPoint/
 ### Environment setup (new pod)
 
 ```bash
-git clone https://github.com/gabrielmanalu/EdgeFusion-CenterPoint.git
-cd /workspace/mmdetection3d
-bash EdgeFusion-CenterPoint/scripts/setup_env.sh
+git clone https://github.com/gabrielmanalu/EdgeFusion-CenterPoint.git \
+    /workspace/mmdetection3d/EdgeFusion-CenterPoint
+cd /workspace/mmdetection3d/EdgeFusion-CenterPoint
+bash scripts/setup_env.sh 2>&1 | tee /workspace/setup_env.log
 source /workspace/activate_env.sh
-
-# Verify
-python -c "import torch, mmdet3d; print(torch.__version__, mmdet3d.__version__)"
 ```
 
-Setup installs mmcv 2.1.0 from source (~60-90 min), mmdet3d from the
-autowarefoundation fork, and all dependencies.
+Setup installs PyTorch 2.1.0+cu118, mmcv 2.1.0, mmdet3d from the
+autowarefoundation fork, and all dependencies (~60-90 min).
 
 ### Set variables
 
@@ -139,9 +137,10 @@ autowarefoundation fork, and all dependencies.
 CFG=configs/centerpoint/centerpoint_pillar02_second_secfpn_head-circlenms_8xb4-cyclic-20e_nus-3d.py
 CKPT=/workspace/data/centerpoint/centerpoint_02pillar_second_secfpn_circlenms_4x8_cyclic_20e_nus_20220811_031844-191a3822.pth
 PTQ=EdgeFusion-CenterPoint/compression/results/ptq/ptq_calibrated.pth
+QAT=EdgeFusion-CenterPoint/compression/results/qat/qat_best.pth
 ```
 
-### 1. Evaluate FP32 baseline
+### 1. Evaluate FP32 baseline (~30 min)
 
 ```bash
 python EdgeFusion-CenterPoint/baseline/eval.py \
@@ -170,7 +169,7 @@ python EdgeFusion-CenterPoint/compression/sensitivity.py \
     --config $CFG --fp32-ckpt $CKPT --ptq-ckpt $PTQ
 ```
 
-### 5. QAT fine-tuning (~5-6 hrs)
+### 5. QAT fine-tuning (~12 hrs)
 
 ```bash
 python EdgeFusion-CenterPoint/compression/qat.py \
@@ -179,6 +178,38 @@ python EdgeFusion-CenterPoint/compression/qat.py \
     --ptq-ckpt $PTQ \
     --sensitivity EdgeFusion-CenterPoint/compression/results/sensitivity/sensitivity.json \
     --ptq-map 0.4812 --epochs 5 --batch-size 4
+```
+
+---
+
+## Checkpoints
+
+Model weights are not stored in this repository.
+
+**Download from Google Drive:** *(link to be added)*
+
+| File | Description | Size |
+| ---- | ----------- | ---- |
+| `centerpoint_02pillar_...pth` | FP32 baseline (open-mmlab) | 24 MB |
+| `ptq_calibrated.pth` | PTQ INT8 calibrated checkpoint | 24 MB |
+| `qat_best.pth` | QAT INT8 fine-tuned checkpoint | 24 MB |
+| `sensitivity.json` | Per-layer sensitivity results | 3 KB |
+| `onnx_multitask/` | Exported ONNX files (encoder + backbone-neck-head) | 40 MB |
+
+The FP32 baseline checkpoint is also available directly from the
+[open-mmlab model zoo](https://github.com/open-mmlab/mmdetection3d/tree/main/configs/centerpoint).
+
+After downloading, place files at:
+
+```bash
+mkdir -p /workspace/data/centerpoint
+# Checkpoints
+cp ptq_calibrated.pth \
+   EdgeFusion-CenterPoint/compression/results/ptq/
+cp qat_best.pth \
+   EdgeFusion-CenterPoint/compression/results/qat/
+cp sensitivity.json \
+   EdgeFusion-CenterPoint/compression/results/sensitivity/
 ```
 
 ---
