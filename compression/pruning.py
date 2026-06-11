@@ -13,14 +13,24 @@ Usage:
         --checkpoint $CKPT \
         --ratio 0.25 \
         --epochs 5 \
-        --batch-size 4
+        --batch-size 16 \
+        --lr 4e-4 \
+        --num-workers 16
 
 Sweep:
     for RATIO in 0.25 0.40 0.55; do
         python EdgeFusion-CenterPoint/compression/pruning.py \\
             --config $CFG --checkpoint $CKPT \\
-            --ratio $RATIO --epochs 5 --batch-size 4
+            --ratio $RATIO --epochs 5 \\
+            --batch-size 16 --lr 4e-4 --num-workers 16
     done
+    # Add --use-cbgs for full CBGS dataset (~4.4x slower, better rare class recovery)
+
+Eval only (after early stop):
+    python EdgeFusion-CenterPoint/compression/pruning.py \
+        --config $CFG \
+        --eval-only \
+        --model-path compression/results/pruning/ratio_25/pruned_25_epoch3.pth
 """
 
 import argparse
@@ -43,23 +53,55 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+def eval_checkpoint(args: argparse.Namespace) -> None:
+    """Evaluate a saved pruned model checkpoint (.pt full model object)."""
+    cfg = Config.fromfile(args.config)
+    init_default_scope(cfg.get('default_scope', 'mmdet3d'))
+
+    print(f'[eval] Loading pruned model from {args.model_path}...')
+    model = torch.load(args.model_path, map_location='cuda:0')
+    model.cuda()
+    _set_train_cfg_from_config(model, cfg)
+
+    metrics = evaluate(model, cfg)
+    print(f'[eval] mAP {metrics["mAP"]:.4f}  NDS {metrics["NDS"]:.4f}')
+
+    out = Path(args.model_path).with_suffix('_metrics.json')
+    with open(out, 'w') as f:
+        json.dump(metrics, f, indent=2)
+    print(f'[eval] Saved to {out}')
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description='CenterPoint structured pruning sweep')
     p.add_argument('--config', required=True)
-    p.add_argument('--checkpoint', required=True, help='FP32 .pth checkpoint')
-    p.add_argument('--ratio', type=float, required=True,
-                   help='Channel pruning ratio (e.g. 0.25 removes 25% channels)')
+    p.add_argument('--checkpoint', help='FP32 .pth checkpoint (not needed for --eval-only)')
+    p.add_argument('--ratio', type=float, help='Channel pruning ratio')
     p.add_argument('--epochs', type=int, default=5)
     p.add_argument('--batch-size', type=int, default=4)
     p.add_argument('--lr', type=float, default=1e-4)
+    p.add_argument('--num-workers', type=int, default=8)
+    p.add_argument('--use-cbgs', action='store_true', default=False,
+                   help='Use CBGS dataset (~4.4x more steps, better rare class sampling). '
+                        'Default: raw dataset (~1.7 hrs/epoch vs ~7.5 hrs/epoch).')
     p.add_argument('--out', default=str(RESULTS_DIR))
+    p.add_argument('--eval-only', action='store_true',
+                   help='Evaluate a saved pruned model without training')
+    p.add_argument('--model-path', type=str,
+                   help='Path to pruned_model_XX_epochY.pth for --eval-only')
     return p.parse_args()
 
 
-def build_train_loader(cfg: Config, batch_size: int):
+def build_train_loader(cfg: Config, batch_size: int, num_workers: int = 8,
+                       use_cbgs: bool = False):
     cfg = cfg.copy()
+    if not use_cbgs and cfg.train_dataloader.dataset.type == 'CBGSDataset':
+        # Unwrap CBGSDataset → raw NuScenesDataset
+        # Raw: ~1,758 steps/epoch at batch=16 (~1.7 hrs)
+        # CBGS: ~7,724 steps/epoch at batch=16 (~7.5 hrs)
+        cfg.train_dataloader.dataset = cfg.train_dataloader.dataset.dataset
     cfg.train_dataloader.batch_size = batch_size
-    cfg.train_dataloader.num_workers = 4
+    cfg.train_dataloader.num_workers = num_workers
     return Runner.build_dataloader(cfg.train_dataloader)
 
 
@@ -111,7 +153,7 @@ def _set_train_cfg_from_config(model: nn.Module, cfg: Config) -> None:
 # ── pruning ───────────────────────────────────────────────────────────────────
 
 class BackboneNeck(nn.Module):
-    """Wrapper for joint backbone+neck pruning dependency tracing."""
+    """Wrapper for backbone + neck dependency tracing."""
     def __init__(self, backbone, neck):
         super().__init__()
         self.backbone = backbone
@@ -123,7 +165,7 @@ class BackboneNeck(nn.Module):
 
         def _traceable(self, x):
             outs = [self.deblocks[i](x[i]) for i in range(len(self.deblocks))]
-            return [torch.cat(outs, dim=1) if len(self.deblocks) > 1 else outs[0]]
+            return torch.cat(outs, dim=1) if len(self.deblocks) > 1 else outs[0]
 
         _S.forward = _traceable
         try:
@@ -134,13 +176,46 @@ class BackboneNeck(nn.Module):
         return out
 
 
+def _rebuild_shared_conv(model: nn.Module, bev_example: torch.Tensor) -> None:
+    """Rebuild shared_conv with correct in_channels after backbone+neck pruning.
+
+    torch-pruning adjusts backbone+neck channels but shared_conv still expects
+    the original channel count. We detect the actual pruned neck output via a
+    forward pass and reinitialize shared_conv.conv with the correct in_channels.
+    Fine-tuning recovers the reinitialized weights quickly (single 3x3 conv).
+    """
+    model.eval()
+    with torch.no_grad():
+        feats = model.pts_backbone(bev_example)
+        neck_out = model.pts_neck(feats)
+        new_in_ch = neck_out[0].shape[1]
+
+    old_conv = model.pts_bbox_head.shared_conv.conv
+    if old_conv.in_channels == new_in_ch:
+        return  # No change needed
+
+    new_conv = nn.Conv2d(
+        new_in_ch, old_conv.out_channels,
+        old_conv.kernel_size, old_conv.stride, old_conv.padding,
+        bias=old_conv.bias is not None,
+    ).to(bev_example.device)
+    nn.init.kaiming_normal_(new_conv.weight)
+    if new_conv.bias is not None:
+        nn.init.zeros_(new_conv.bias)
+
+    model.pts_bbox_head.shared_conv.conv = new_conv
+    print(f'[pruning] shared_conv rebuilt: {old_conv.in_channels} → {new_in_ch} in_channels')
+
+
 def prune_model(model: nn.Module, bev_example: torch.Tensor, ratio: float) -> None:
     """Apply L1-norm structured channel pruning to backbone + neck."""
     combined = BackboneNeck(model.pts_backbone, model.pts_neck)
     combined.eval()
 
-    # Ignore head — not connected to backbone/neck in this tracing context
-    ignored = []
+    # Param count before
+    before = sum(p.numel() for p in model.pts_backbone.parameters())
+    before += sum(p.numel() for p in model.pts_neck.parameters())
+    print(f'[pruning] backbone+neck params before: {before/1e6:.2f}M')
 
     importance = tp.importance.MagnitudeImportance(p=1)
     pruner = tp.pruner.MagnitudePruner(
@@ -148,20 +223,21 @@ def prune_model(model: nn.Module, bev_example: torch.Tensor, ratio: float) -> No
         example_inputs=bev_example,
         importance=importance,
         pruning_ratio=ratio,
-        ignored_layers=ignored,
+        ignored_layers=[],
         global_pruning=False,
     )
-
     pruner.step()
 
-    # Write back pruned modules
     model.pts_backbone = combined.backbone
     model.pts_neck = combined.neck
 
-    # Count remaining params
+    # Rebuild shared_conv to accept pruned neck output channels
+    _rebuild_shared_conv(model, bev_example)
+
     total = sum(p.numel() for p in model.pts_backbone.parameters())
     total += sum(p.numel() for p in model.pts_neck.parameters())
-    print(f'[pruning] ratio={ratio:.0%} — backbone+neck params: {total/1e6:.2f}M')
+    print(f'[pruning] backbone+neck params after:  {total/1e6:.2f}M '
+          f'({100*total/before:.1f}% of original)')
 
 
 # ── fine-tuning ───────────────────────────────────────────────────────────────
@@ -171,6 +247,8 @@ def fine_tune(
     train_loader,
     epochs: int,
     lr: float,
+    out_dir: Path,
+    ratio: float,
     ema_decay: float = 0.999,
 ) -> None:
     import copy
@@ -178,9 +256,9 @@ def fine_tune(
     total_steps = epochs * len(train_loader)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
 
-    # EMA model — CenterPoint uses EMA weights for final mAP accuracy
     ema_model = copy.deepcopy(model)
     ema_model.eval()
+    ratio_str = f'{int(ratio * 100):02d}'
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -199,7 +277,6 @@ def fine_tune(
             optimizer.step()
             scheduler.step()
 
-            # EMA update
             with torch.no_grad():
                 for ema_p, p in zip(ema_model.parameters(), model.parameters()):
                     ema_p.data.mul_(ema_decay).add_(p.data, alpha=1.0 - ema_decay)
@@ -212,7 +289,16 @@ def fine_tune(
         print(f'[pruning] epoch {epoch}/{epochs}  loss {avg_loss:.4f}  '
               f'lr {scheduler.get_last_lr()[0]:.2e}')
 
-    # Load EMA weights before evaluation
+        # Save checkpoint after every epoch — allows early stopping at any point
+        ckpt_path = out_dir / f'pruned_{ratio_str}_epoch{epoch}.pth'
+        torch.save({
+            'state_dict': ema_model.state_dict(),
+            'ratio': ratio,
+            'epoch': epoch,
+            'loss': avg_loss,
+        }, ckpt_path)
+        print(f'[pruning] checkpoint saved: {ckpt_path.name}')
+
     model.load_state_dict(ema_model.state_dict())
     print('[pruning] EMA weights loaded for evaluation.')
 
@@ -243,6 +329,15 @@ def evaluate(model: nn.Module, cfg: Config) -> dict:
 
 def main() -> None:
     args = parse_args()
+
+    if args.eval_only:
+        if not args.model_path:
+            raise ValueError('--model-path required with --eval-only')
+        eval_checkpoint(args)
+        return
+
+    if not args.checkpoint or args.ratio is None:
+        raise ValueError('--checkpoint and --ratio required for training')
     ratio_str = f'{int(args.ratio * 100):02d}'
     out_dir = Path(args.out) / f'ratio_{ratio_str}'
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -255,7 +350,9 @@ def main() -> None:
     _set_train_cfg_from_config(model, cfg)
 
     # Get BEV example for tracing
-    train_loader = build_train_loader(cfg, args.batch_size)
+    train_loader = build_train_loader(cfg, args.batch_size, args.num_workers, args.use_cbgs)
+    mode = 'CBGS' if args.use_cbgs else 'raw'
+    print(f'[pruning] Dataset: {mode} ({len(train_loader)} steps/epoch)')
     sample_batch = next(iter(train_loader))
     bev_example = get_bev_example(model, sample_batch)
 
@@ -274,7 +371,7 @@ def main() -> None:
 
         # ── 2. Fine-tune ──────────────────────────────────────────────────────
         print(f'\n[pruning] Fine-tuning for {args.epochs} epochs...')
-        fine_tune(model, train_loader, args.epochs, args.lr)
+        fine_tune(model, train_loader, args.epochs, args.lr, out_dir, args.ratio)
 
         # ── 3. Evaluate ───────────────────────────────────────────────────────
         print('\n[pruning] Evaluating...')
