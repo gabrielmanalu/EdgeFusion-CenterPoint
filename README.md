@@ -63,7 +63,7 @@ accuracy / latency / power trade-off look like across the full Pareto front?
 | ------------- | ------ | ------ | ------ | ------ |
 | FP32 baseline | 0.4815 | 0.5922 | —      | —      |
 | PTQ INT8      | 0.4812 | 0.5903 | −0.03% | −0.19% |
-| QAT INT8      | TBD    | TBD    | —      | —      |
+| QAT INT8      | 0.4814 | 0.5910 | −0.01% | −0.12% |
 
 ### Per-class AP (FP32 baseline)
 
