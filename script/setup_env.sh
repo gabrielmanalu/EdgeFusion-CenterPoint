@@ -90,12 +90,22 @@ $PIP install \
     numba \
     tqdm \
     rich \
-    open3d
+    open3d \
+    lyft_dataset_sdk \
+    plyfile \
+    scikit-image \
+    tensorboard \
+    trimesh
 
 # ── activate_env.sh ───────────────────────────────────────────────────────────
 cat > "$WORKSPACE/activate_env.sh" << 'ENVEOF'
 source /workspace/miniconda3/etc/profile.d/conda.sh
 conda activate autoware_cp
+python -c "
+import torch
+gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no GPU'
+print(f'[autoware_cp] torch {torch.__version__} | GPU: {gpu}')
+"
 ENVEOF
 echo "activate_env.sh written to $WORKSPACE/activate_env.sh"
 
