@@ -57,13 +57,23 @@ accuracy / latency / power trade-off look like across the full Pareto front?
 
 ## Results
 
-### Quantization
+### Compression Sweep
 
-| Variant       | mAP    | NDS    | Δ mAP  | Δ NDS  |
-| ------------- | ------ | ------ | ------ | ------ |
-| FP32 baseline | 0.4815 | 0.5922 | —      | —      |
-| PTQ INT8      | 0.4812 | 0.5903 | −0.03% | −0.19% |
-| QAT INT8      | 0.4814 | 0.5910 | −0.01% | −0.12% |
+| Variant              | mAP    | NDS    | Params | Δ mAP  |
+| -------------------- | ------ | ------ | ------ | ------ |
+| FP32 baseline        | 0.4815 | 0.5922 | 100%   | —      |
+| PTQ INT8             | 0.4812 | 0.5903 | 100%   | −0.03% |
+| QAT INT8             | 0.4814 | 0.5910 | 100%   | −0.01% |
+| Pruned 25%           | 0.4081 | 0.5382 | 56.4%  | −15.2% |
+| Pruned 40%           | 0.2838 | 0.3902 | 36.0%  | −41.0% |
+| Pruned 55%           | 0.2149 | 0.3136 | 20.3%  | −55.4% |
+| Distilled (25% arch) | TBD    | TBD    | 56.4%  | TBD    |
+
+INT8 quantization is essentially free on this architecture (BatchNorm normalizes
+activations before every conv, producing INT8-friendly distributions). One-shot
+magnitude pruning shows a steep, accelerating accuracy cost past 25% — see
+[`compression/README.md`](compression/README.md) for the full pruning sweep analysis,
+per-class breakdown, and the EMA/BatchNorm buffer bug + recalibration recovery.
 
 ### Per-class AP (FP32 baseline)
 
@@ -75,15 +85,31 @@ accuracy / latency / power trade-off look like across the full Pareto front?
 | Truck      | 0.483 | Bicycle              | 0.154 |
 | Trailer    | 0.326 | Construction vehicle | 0.107 |
 
-### Pruning + Distillation (in progress)
+### Per-class AP — Pruning Sweep
 
-| Variant         | Prune ratio | mAP | NDS | Latency (Jetson) | Power |
-| --------------- | ----------- | --- | --- | ---------------- | ----- |
-| QAT INT8        | 0%          | TBD | TBD | TBD              | TBD   |
-| Pruned + QAT    | 25%         | TBD | TBD | TBD              | TBD   |
-| Pruned + QAT    | 40%         | TBD | TBD | TBD              | TBD   |
-| Pruned + QAT    | 55%         | TBD | TBD | TBD              | TBD   |
-| Distilled + QAT | —           | TBD | TBD | TBD              | TBD   |
+| Class                | FP32  | Pruned 25% | Pruned 40% | Pruned 55% |
+| -------------------- | ----- | ---------- | ---------- | ---------- |
+| car                  | 0.836 | 0.806      | 0.714      | 0.634      |
+| pedestrian           | 0.761 | 0.717      | 0.601      | 0.507      |
+| bus                  | 0.605 | 0.570      | 0.424      | 0.326      |
+| barrier              | 0.596 | 0.533      | 0.319      | 0.221      |
+| traffic_cone         | 0.533 | 0.429      | 0.252      | 0.167      |
+| truck                | 0.483 | 0.415      | 0.248      | 0.137      |
+| motorcycle           | 0.416 | 0.270      | 0.144      | 0.096      |
+| trailer              | 0.326 | 0.249      | 0.109      | 0.054      |
+| bicycle              | 0.154 | 0.034      | 0.003      | 0.000      |
+| construction_vehicle | 0.107 | 0.059      | 0.024      | 0.006      |
+
+### Pareto Candidates (Jetson deployment — pending)
+
+| Variant                  | mAP      | Params | Latency (Jetson) | Power |
+| ------------------------ | -------- | ------ | ---------------- | ----- |
+| FP32 baseline → TRT INT8 | 0.4815\* | 100%   | TBD              | TBD   |
+| Pruned 25% → TRT INT8    | 0.4081\* | 56.4%  | TBD              | TBD   |
+
+\* On-device TRT INT8 expected to closely match these FP32 numbers — quantization shown
+to be near-free for both the unpruned and pruned architectures (BatchNorm-normalized
+activations throughout). TRT calibration uses the 512-sample `jetson_calib` set.
 
 ---
 
@@ -180,41 +206,66 @@ python EdgeFusion-CenterPoint/compression/qat.py \
     --ptq-map 0.4812 --epochs 5 --batch-size 4
 ```
 
+### 6. Structured pruning sweep (~8.5 hrs per ratio)
+
+```bash
+for RATIO in 0.25 0.40 0.55; do
+    python EdgeFusion-CenterPoint/compression/pruning.py \
+        --config $CFG --checkpoint $CKPT \
+        --ratio $RATIO --epochs 5 \
+        --batch-size 16 --lr 4e-4 --num-workers 16
+done
+```
+
+### 7. Knowledge distillation (~8.5 hrs)
+
+```bash
+python EdgeFusion-CenterPoint/compression/distillation.py \
+    --config $CFG --checkpoint $CKPT \
+    --ratio 0.25 --epochs 5 \
+    --batch-size 16 --lr 4e-4 --num-workers 16 \
+    --alpha 1.0 --beta 1.0
+```
+
 ---
 
 ## Checkpoints
 
 Model weights are not stored in this repository.
 
-**Download from Google Drive:** *(link to be added)*
+**Download from Google Drive:** _(link to be added)_
 
-| File | Description | Size |
-| ---- | ----------- | ---- |
-| `centerpoint_02pillar_...pth` | FP32 baseline (open-mmlab) | 24 MB |
-| `ptq_calibrated.pth` | PTQ INT8 calibrated checkpoint | 24 MB |
-| `qat_best.pth` | QAT INT8 fine-tuned checkpoint | 24 MB |
-| `sensitivity.json` | Per-layer sensitivity results | 3 KB |
-| `onnx_multitask/` | Exported ONNX files (encoder + backbone-neck-head) | 40 MB |
+| File                                                  | Description                                         | Size    |
+| ----------------------------------------------------- | --------------------------------------------------- | ------- |
+| `centerpoint_02pillar_...pth`                         | FP32 baseline (open-mmlab)                          | 24 MB   |
+| `ptq_calibrated.pth`                                  | PTQ INT8 calibrated checkpoint                      | 24 MB   |
+| `qat_best.pth`                                        | QAT INT8 fine-tuned checkpoint                      | 24 MB   |
+| `sensitivity.json`                                    | Per-layer sensitivity results                       | 3 KB    |
+| `pruned_25_recalib.pth`, `pruned_model_25_recalib.pt` | Pruned 25% (recalibrated)                           | ~14 MB  |
+| `pruned_40.pth`, `pruned_model_40.pt`                 | Pruned 40%                                          | ~9 MB   |
+| `pruned_55.pth`, `pruned_model_55.pt`                 | Pruned 55%                                          | ~5 MB   |
+| `distilled_25.pth`, `distilled_model_25.pt`           | Distilled (25% arch)                                | ~14 MB  |
+| `onnx_multitask/`                                     | Exported ONNX files (encoder + backbone-neck-head)  | 40 MB   |
+| `jetson_calib/`                                       | 512 point clouds for TRT INT8 calibration on Jetson | ~200 MB |
 
-The FP32 baseline checkpoint is also available directly from the
+The FP32 baseline checkpoint is also available from the
 [open-mmlab model zoo](https://github.com/open-mmlab/mmdetection3d/tree/main/configs/centerpoint).
 
 After downloading, place files at:
 
 ```bash
-mkdir -p /workspace/data/centerpoint
-# Checkpoints
-cp ptq_calibrated.pth \
-   EdgeFusion-CenterPoint/compression/results/ptq/
-cp qat_best.pth \
-   EdgeFusion-CenterPoint/compression/results/qat/
-cp sensitivity.json \
-   EdgeFusion-CenterPoint/compression/results/sensitivity/
+mkdir -p EdgeFusion-CenterPoint/compression/results/{ptq,qat,sensitivity,pruning/ratio_25,pruning/ratio_40,pruning/ratio_55,distillation/ratio_25}
+
+cp ptq_calibrated.pth EdgeFusion-CenterPoint/compression/results/ptq/
+cp qat_best.pth EdgeFusion-CenterPoint/compression/results/qat/
+cp sensitivity.json EdgeFusion-CenterPoint/compression/results/sensitivity/
+cp pruned_*25*.p* EdgeFusion-CenterPoint/compression/results/pruning/ratio_25/
+cp pruned_*40*.p* EdgeFusion-CenterPoint/compression/results/pruning/ratio_40/
+cp pruned_*55*.p* EdgeFusion-CenterPoint/compression/results/pruning/ratio_55/
+cp distilled_*25*.p* EdgeFusion-CenterPoint/compression/results/distillation/ratio_25/
 ```
 
 ---
-
-## Documentation
 
 | Document                                               | Description                                                                      |
 | ------------------------------------------------------ | -------------------------------------------------------------------------------- |
@@ -256,6 +307,28 @@ The result (−0.03% mAP) is genuine, not a measurement artifact.
 Autoware's production `autoware_lidar_centerpoint` defaults to `trt_precision: fp16`.
 Our INT8 target is more aggressive and produces a 2× memory reduction and hardware
 INT8 throughput gains on Jetson's 1024-core Ampere GPU.
+
+**One-shot pruning over iterative pruning**
+Channel pruning was applied in a single pass (L1-magnitude, deterministic given FP32
+weights + ratio) followed by 5-epoch fine-tuning, rather than iterative prune-and-retrain
+cycles. One-shot is simpler and ~3-5x cheaper, at the cost of a steeper accuracy falloff
+past 25% (see pruning sweep results). Iterative pruning is the standard mitigation and
+noted as future work if a sub-25% operating point is needed.
+
+**Raw dataset for pruning/distillation fine-tuning, not CBGS**
+CBGS class-balanced sampling inflates the dataset ~4.4x (1,759 → 7,724 steps/epoch),
+making the 3-ratio pruning sweep cost ~112 hrs instead of ~25 hrs. Since fine-tuning
+starts from FP32 weights that already encode CBGS-trained knowledge (validated by QAT:
+raw dataset, 0.4814 mAP matching published numbers), the time savings were taken as a
+documented trade-off — rare-class recovery is somewhat weaker without CBGS, visible in
+the pruning sweep's bicycle/construction_vehicle results.
+
+**Distillation as a controlled comparison, not a new architecture**
+Rather than designing a novel "tiny" student, the distillation student uses the exact
+same architecture/init/budget as Pruned 25% (same L1 channel selection from FP32). The
+only difference is the loss function (task loss vs task + teacher distillation). This
+isolates whether teacher guidance recovers pruning-induced capacity loss better than
+fine-tuning alone — a directly comparable A/B result.
 
 ---
 

@@ -1,10 +1,12 @@
 # Compression
 
-This directory contains the full INT8 quantization pipeline for CenterPoint:
-Post-Training Quantization (PTQ) → Sensitivity Analysis → Quantization-Aware Training (QAT).
+This directory contains the full compression pipeline for CenterPoint:
+Post-Training Quantization (PTQ) → Sensitivity Analysis → Quantization-Aware Training (QAT)
+→ Structured Pruning Sweep → Knowledge Distillation → Pareto Assembly.
 
-The goal is to establish an INT8-quantized model that preserves FP32 accuracy, to be used as
-the starting point for the pruning and distillation sweeps that follow.
+The goal is to map the accuracy / size / latency trade-off space for deploying CenterPoint
+on Jetson Orin Nano (8GB, 15W), and identify which compressed variants are worth carrying
+forward to TensorRT INT8 benchmarking on real hardware.
 
 ---
 
@@ -15,14 +17,16 @@ compression/
 ├── ptq.py              # PTQ calibration + INT8 simulation eval
 ├── sensitivity.py      # Per-layer loss-proxy sensitivity analysis
 ├── qat.py              # QAT fine-tuning with mixed precision
-├── pruning.py          # Structured channel pruning
-├── distillation.py     # Knowledge distillation
+├── pruning.py          # Structured channel pruning + BN recalibration
+├── distillation.py     # Knowledge distillation (FP32 teacher -> pruned-arch student)
 ├── pareto.py           # Pareto front assembly
 ├── check_fakequant.py  # Diagnostic: verify FakeQuantize nodes are active
-└── results/
+└── results/            # not in repo — see root README Checkpoints section
     ├── ptq/            # ptq_calibrated.pth, ptq_metrics.json
     ├── sensitivity/    # sensitivity.json
-    └── qat/            # qat_best.pth, qat_metrics.json
+    ├── qat/            # qat_best.pth, qat_metrics.json
+    ├── pruning/        # ratio_25/, ratio_40/, ratio_55/ — pruned_*.pth, pruned_model_*.pt
+    └── distillation/   # ratio_25/ — distilled_*.pth, distilled_model_*.pt
 ```
 
 ---
@@ -76,6 +80,45 @@ python EdgeFusion-CenterPoint/compression/qat.py \
 
 Outputs: `results/qat/qat_best.pth`, `results/qat/qat_metrics.json`
 
+### 4. Structured Pruning Sweep (~8.5 hrs per ratio, run in tmux)
+
+```bash
+for RATIO in 0.25 0.40 0.55; do
+    python EdgeFusion-CenterPoint/compression/pruning.py \
+        --config $CFG --checkpoint $CKPT \
+        --ratio $RATIO --epochs 5 \
+        --batch-size 16 --lr 4e-4 --num-workers 16
+done
+```
+
+Outputs per ratio: `results/pruning/ratio_XX/pruned_XX.pth`,
+`pruned_model_XX.pt`, `pruned_XX_metrics.json`, plus per-epoch checkpoints
+(`pruned_XX_epochN.pth`) for early stopping.
+
+If a checkpoint shows near-zero mAP (stale BatchNorm buffers — see
+"EMA + BatchNorm Buffer Bug" below), recover without retraining:
+
+```bash
+python EdgeFusion-CenterPoint/compression/pruning.py \
+    --config $CFG --checkpoint $CKPT --ratio 0.25 \
+    --model-path results/pruning/ratio_25/pruned_25_epoch5.pth \
+    --recalibrate --recalib-batches 200 \
+    --batch-size 16 --num-workers 16
+```
+
+### 5. Knowledge Distillation (~8.5 hrs, run in tmux)
+
+```bash
+python EdgeFusion-CenterPoint/compression/distillation.py \
+    --config $CFG --checkpoint $CKPT \
+    --ratio 0.25 --epochs 5 \
+    --batch-size 16 --lr 4e-4 --num-workers 16 \
+    --alpha 1.0 --beta 1.0
+```
+
+Outputs: `results/distillation/ratio_25/distilled_25.pth`, `distilled_model_25.pt`,
+`distilled_25_metrics.json`.
+
 ### Diagnostic (if FakeQuantize nodes appear missing)
 
 ```bash
@@ -87,15 +130,26 @@ python EdgeFusion-CenterPoint/compression/check_fakequant.py \
 
 ## Results Summary
 
-| Variant | mAP | NDS | vs FP32 |
-|---|---|---|---|
-| FP32 baseline | 48.15 | 59.22 | — |
-| PTQ INT8 | 48.12 | 59.03 | −0.03% / −0.19% |
-| QAT INT8 | **48.14** | **59.10** | −0.01% / −0.12% |
+| Variant              | mAP       | NDS       | Params | vs FP32         |
+| -------------------- | --------- | --------- | ------ | --------------- |
+| FP32 baseline        | 48.15     | 59.22     | 100%   | —               |
+| PTQ INT8             | 48.12     | 59.03     | 100%   | −0.03% / −0.19% |
+| QAT INT8             | **48.14** | **59.10** | 100%   | −0.01% / −0.12% |
+| Pruned 25%           | 40.81     | 53.82     | 56.4%  | −15.2% / −9.1%  |
+| Pruned 40%           | 28.38     | 39.02     | 36.0%  | −41.0% / −34.1% |
+| Pruned 55%           | 21.49     | 31.36     | 20.3%  | −55.4% / −47.0% |
+| Distilled (25% arch) | TBD       | TBD       | 56.4%  | TBD             |
 
 QAT recovered +0.0002 mAP and +0.0007 NDS over PTQ — small refinements as expected
 when the architecture is already INT8-robust. The one marginally-sensitive layer
 (`blocks.0.3` weight) was kept in FP16 via mixed precision.
+
+The pruning sweep shows a steep, accelerating accuracy cost: 25% pruning (56.4% of
+backbone+neck params) loses 15.2% relative mAP, but 40% pruning (36.0% params) loses
+41.0% — more than 2.5x the relative cost for ~20pp fewer params. By 55% (20.3% params),
+several rare classes (bicycle, construction_vehicle) collapse to near-zero AP and
+velocity estimation degrades severely (mAVE 1.05 vs 0.35 baseline). One-shot magnitude
+pruning hits a capacity ceiling quickly past 25% — see "Pruning Sweep" below.
 
 ---
 
@@ -327,6 +381,175 @@ robust to inference-only configs.
 
 ---
 
+## Pruning Sweep
+
+### Method: L1-magnitude structured channel pruning
+
+`pruning.py` uses [torch-pruning](https://github.com/VainF/Torch-Pruning) to remove
+whole output channels from `pts_backbone` (SECOND) and `pts_neck` (SECONDFPN), selected
+by L1 weight magnitude — channels with the smallest total weight magnitude are removed
+first, under the assumption they contribute least to the output.
+
+Channel pruning compounds across layer pairs: removing 25% of channels reduces both the
+output dimension of one conv and the input dimension of the next, so total parameters
+scale as `(1 − ratio)²`:
+
+| Ratio | Params remaining | Formula            |
+| ----- | ---------------- | ------------------ |
+| 25%   | 56.4%            | (1−0.25)² = 0.5625 |
+| 40%   | 36.0%            | (1−0.40)² = 0.36   |
+| 55%   | 20.3%            | (1−0.55)² = 0.2025 |
+
+### FX tracing fix for SECONDFPN (pruning)
+
+Same issue as PTQ's FX preparation (see below): `SECONDFPN.forward` uses `len(x)` on a
+tuple input, which torch-pruning's tracer can't evaluate symbolically. `pruning.py`
+applies the same temporary monkey-patch — `len(self.deblocks)` instead of `len(x)` —
+during the pruning trace only, reverted immediately after via try/finally.
+
+### shared_conv rebuild
+
+`pts_bbox_head.shared_conv` sits between the neck output (pruned: e.g. 384→288 channels
+at ratio 0.25) and the task heads (frozen, expect a fixed 64-channel input). torch-pruning
+cannot trace through this boundary cleanly — early attempts to include `shared_conv` in
+the pruning graph either left it with stale `in_channels` (crash: "expected 384 channels,
+got 288") or over-pruned its output and broke the task heads (crash: "expected 64
+channels, got 48").
+
+The working approach: prune `pts_backbone` + `pts_neck` only, then run one forward pass
+to detect the actual pruned output width, and reinitialize `shared_conv.conv` with the
+correct `in_channels` (kaiming-normal init). This single 3×3 conv layer learns quickly
+during fine-tuning — by end of epoch 1 its contribution to the loss is no longer
+distinguishable from the rest of the network.
+
+### EMA + BatchNorm Buffer Bug (and recalibration recovery)
+
+The first pruning run (ratio 25%) completed training with a healthy loss curve
+(10.87 → 7.78 → 7.20 → 6.94 → ~6.4) but evaluated at **mAP 0.0026** — essentially zero.
+
+**Root cause:** an EMA (exponential moving average) of model weights was tracked via
+`ema_model.parameters()`, then loaded back via `model.load_state_dict(ema_model.state_dict())`
+before evaluation. `state_dict()` includes both parameters AND buffers — but
+`.parameters()` does NOT include BatchNorm's `running_mean`/`running_var` (these are
+buffers). `ema_model`'s buffers were frozen at the moment of `copy.deepcopy()`, taken
+_before_ any training — especially wrong for the freshly-reinitialized `shared_conv`'s
+BatchNorm, whose statistics never matched a randomly-initialized layer in the first place.
+
+Loading this state dict overwrote `model`'s properly-trained BN buffers (accumulated
+correctly via momentum over 5 epochs of `model.train()`) with these stale,
+pre-training values. At eval time (`model.eval()`), BatchNorm normalizes using
+`running_mean`/`running_var` — with these wrong, every activation is mis-normalized and
+the output is garbage (`mATE`/`mASE`/`mAOE` saturate at their 1.0 clip values).
+
+**Fix (`_merged_ema_state_dict`):** take parameter values from `ema_model` (EMA-smoothed,
+correct) but buffer values from `model` (live, properly-trained BN stats). Applied both
+to per-epoch checkpoints and the final model. Ratios 40% and 55% used this fix from the
+start with no issue.
+
+**Recovery for ratio 25% (no retrain needed):** `--recalibrate` mode rebuilds the pruned
+architecture (deterministic L1 selection given the same FP32 weights + ratio), loads the
+_trained_ EMA parameters from the broken `pruned_25_epoch5.pth` (these were correct —
+only the buffers were stale), resets all BatchNorm running stats, and runs ~200
+forward-only batches in `train()` mode with cumulative averaging (`momentum=None`) to
+recompute `running_mean`/`running_var` from scratch against the trained weights. This is
+the standard "BN re-estimation" technique — ~20 min vs an 8.5 hr retrain, and recovered
+mAP 0.4081.
+
+### Per-class results
+
+| Class                | FP32  | Pruned 25% | Pruned 40% | Pruned 55% |
+| -------------------- | ----- | ---------- | ---------- | ---------- |
+| car                  | 0.836 | 0.806      | 0.714      | 0.634      |
+| pedestrian           | 0.761 | 0.717      | 0.601      | 0.507      |
+| bus                  | 0.605 | 0.570      | 0.424      | 0.326      |
+| barrier              | 0.596 | 0.533      | 0.319      | 0.221      |
+| traffic_cone         | 0.533 | 0.429      | 0.252      | 0.167      |
+| truck                | 0.483 | 0.415      | 0.248      | 0.137      |
+| motorcycle           | 0.416 | 0.270      | 0.144      | 0.096      |
+| trailer              | 0.326 | 0.249      | 0.109      | 0.054      |
+| bicycle              | 0.154 | 0.034      | 0.003      | 0.000      |
+| construction_vehicle | 0.107 | 0.059      | 0.024      | 0.006      |
+
+Already-rare classes (bicycle, construction_vehicle) degrade fastest and disproportionately
+— consistent with raw-dataset fine-tuning (no CBGS oversampling; see "Dataset: raw vs CBGS"
+below). Velocity estimation (mAVE) also degrades sharply: 0.350 (FP32) → 0.408 (25%) →
+0.848 (40%) → 1.053 (55%), with some classes (bus, motorcycle) exceeding 2.0 at 55% —
+reduced backbone capacity struggles most with temporal/motion cues.
+
+### Dataset: raw vs CBGS
+
+`pruning.py` defaults to the **raw** nuScenes dataset (1,759 steps/epoch at batch=16,
+~1.7 hrs/epoch) rather than CBGS class-balanced sampling (7,724 steps/epoch, ~7.5
+hrs/epoch — a 4.4x cost). `--use-cbgs` is available if needed.
+
+Rationale: CBGS oversampling matters most when _learning_ rare-class representations from
+scratch. Here we're fine-tuning from FP32 weights that already encode 20 epochs of
+CBGS-trained knowledge — QAT validated this assumption (raw dataset, 0.4814 mAP, matching
+published FP32 numbers within noise). The pruning sweep accepts that rare-class recovery
+is somewhat weaker without CBGS as a documented trade-off for a 4.4x time reduction
+across three ratios (vs ~112 hrs total with CBGS).
+
+### Why pruning recovery used fine-tuning, not QAT
+
+QAT (Quantization-Aware Training) recovers _quantization_ loss by training with
+FakeQuantize active. Pruning loss is a different problem — physically removed channels
+mean reduced representational capacity, which FakeQuantize simulation doesn't address.
+Given QAT vs PTQ delta on the unpruned baseline was only +0.02% (statistical noise), QAT
+on top of pruned models would not meaningfully recover pruning-induced loss; the 5-epoch
+fine-tune (AdamW, cosine LR, EMA) is the correct recovery mechanism and is what produced
+the results above.
+
+---
+
+## Knowledge Distillation
+
+### Approach: controlled comparison against Pruned 25%
+
+`distillation.py` builds a student with the **same architecture, initialization, epoch
+budget, and dataset** as `pruning.py`'s ratio_25 run — FP32 checkpoint → L1-magnitude
+channel selection (deterministic, identical to ratio_25) → 5 epochs, raw dataset,
+batch=16. The only variable is the training signal:
+
+```
+Pruned 25%:  L_task only                              → 0.4081 mAP
+Distilled:   L_task + alpha·L_heatmap + beta·L_reg    → TBD
+```
+
+This isolates the effect of teacher guidance from architecture/compute differences.
+
+### Loss design
+
+```
+L_total = L_task + alpha · L_heatmap_distill + beta · L_reg_distill
+```
+
+`L_task` — the same GT-based CenterPoint loss used in pruning's fine-tune.
+
+`L_heatmap_distill` — dense MSE between teacher and student sigmoid heatmaps, across all
+spatial locations and classes. This is the primary "dark knowledge" channel: the teacher's
+soft confidence map (including low-confidence signal on rare classes) carries information
+that hard GT labels alone don't — directly targeting the rare-class collapse seen in the
+pruning sweep (bicycle, construction_vehicle).
+
+`L_reg_distill` — L1 between teacher and student regression outputs (`reg`, `height`,
+`dim`, `rot`, `vel`), weighted per-location by the teacher's heatmap confidence
+(`max` over classes). This soft-attention weighting focuses regression distillation where
+the teacher believes an object exists, without requiring GT-based positive/negative masks
+— targeting the velocity-estimation collapse seen under pruning.
+
+### No feature adapter needed
+
+Pruning only touches `pts_backbone`/`pts_neck`; `shared_conv` is rebuilt to the same
+64-channel output, and task heads are untouched. Teacher and student therefore produce
+_identically-shaped_ head outputs — heatmap/reg/height/dim/rot/vel — so output-level
+distillation needs no adapter convolution. (Feature-level distillation on the 384 vs
+288-channel neck outputs would need one; deliberately excluded from v1 as a lower-value,
+higher-risk addition.)
+
+_(Results to be added once the run completes.)_
+
+---
+
 ## Comparison with Autoware's Deployed Model
 
 Autoware's production `autoware_lidar_centerpoint` uses TRT with `trt_precision: fp16`
@@ -335,15 +558,15 @@ aggressive than Autoware's production default.
 
 Key parameter differences between Autoware's deployed model and ours:
 
-| Parameter | Autoware deployed | This project |
-|---|---|---|
-| `point_cloud_range` z | −3.0 to +5.0 | −5.0 to +3.0 |
-| `voxel_size` | [0.2, 0.2, 8.0] | [0.2, 0.2, 8.0] |
-| `point_feature_size` | 4 | 5 |
-| `encoder_in_feature_size` | 9 | 11 |
-| `trt_precision` | fp16 | INT8 (Jetson target) |
-| Classes | 5 | 10 |
-| Training data | nuScenes + TIER IV internal | nuScenes only |
+| Parameter                 | Autoware deployed           | This project         |
+| ------------------------- | --------------------------- | -------------------- |
+| `point_cloud_range` z     | −3.0 to +5.0                | −5.0 to +3.0         |
+| `voxel_size`              | [0.2, 0.2, 8.0]             | [0.2, 0.2, 8.0]      |
+| `point_feature_size`      | 4                           | 5                    |
+| `encoder_in_feature_size` | 9                           | 11                   |
+| `trt_precision`           | fp16                        | INT8 (Jetson target) |
+| Classes                   | 5                           | 10                   |
+| Training data             | nuScenes + TIER IV internal | nuScenes only        |
 
 The z-range difference reflects different sensor mounting heights between Autoware's test
 vehicle and the nuScenes vehicle. Our model is trained with the standard nuScenes range and
@@ -363,8 +586,16 @@ creates a real accuracy budget that distillation and QAT then recover.
 Compression
 ├─ PTQ calibration          complete — 48.12 mAP, −0.03%
 ├─ Sensitivity analysis     complete — 1/18 nodes sensitive
-├─ QAT fine-tuning          complete
-├─ Structured pruning       3 ratios × fine-tune sweep
-├─ Knowledge distillation   teacher=FP32, student=smaller backbone
-└─ Pareto assembly          accuracy vs latency vs power frontier
+├─ QAT fine-tuning          complete — 48.14 mAP, +0.02% over PTQ
+├─ Structured pruning       complete — 25%/40%/55%, see Pruning Sweep above
+├─ Knowledge distillation   running — controlled comparison vs Pruned 25%
+└─ Pareto assembly          next — accuracy vs params, then vs Jetson latency/power
 ```
+
+Once distillation completes, `pareto.py` assembles all variants (FP32, QAT-INT8,
+Pruned 25/40/55%, Distilled) on an accuracy-vs-params chart and shortlists 2-3 operating
+points for ONNX export and TensorRT INT8 benchmarking on Jetson Orin Nano. Based on the
+pruning curve's steep falloff past 25%, the current leading candidates are **FP32
+baseline** (INT8-safety validated via PTQ/QAT) and **Pruned 25%** — both exported to ONNX
+as standard FP32 models, with TensorRT performing the actual INT8 quantization via
+on-device calibration.
