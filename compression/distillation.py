@@ -337,10 +337,10 @@ def distill_train(
             batch_input_metas = [ds.metainfo for ds in data_samples]
 
             with torch.no_grad():
-                t_feats = teacher.extract_feat(inputs, batch_input_metas)
+                _, t_feats = teacher.extract_feat(inputs, batch_input_metas)
                 t_outs = teacher.pts_bbox_head(t_feats)
 
-            s_feats = student.extract_feat(inputs, batch_input_metas)
+            _, s_feats = student.extract_feat(inputs, batch_input_metas)
             s_outs = student.pts_bbox_head(s_feats)
 
             task_losses = student.pts_bbox_head.loss(s_feats, data_samples)
