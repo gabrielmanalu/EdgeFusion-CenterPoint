@@ -88,7 +88,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--eval-only', action='store_true',
                    help='Evaluate a saved pruned model without training')
     p.add_argument('--model-path', type=str,
-                   help='Path to pruned_model_XX_epochY.pth for --eval-only')
+                   help='Path to pruned model checkpoint for --eval-only or --recalibrate')
+    p.add_argument('--recalibrate', action='store_true',
+                   help='Recover a checkpoint with stale EMA BN buffers (see '
+                        '_merged_ema_state_dict). Requires --checkpoint (FP32), '
+                        '--ratio, and --model-path (broken checkpoint state_dict).')
+    p.add_argument('--recalib-batches', type=int, default=200,
+                   help='Number of forward-only batches for BN recalibration')
     return p.parse_args()
 
 
@@ -242,6 +248,28 @@ def prune_model(model: nn.Module, bev_example: torch.Tensor, ratio: float) -> No
 
 # ── fine-tuning ───────────────────────────────────────────────────────────────
 
+def _merged_ema_state_dict(model: nn.Module, ema_model: nn.Module) -> dict:
+    """Combine EMA-smoothed parameters with the live model's BN buffers.
+
+    ema_model.parameters() are tracked via EMA, but BatchNorm running_mean/
+    running_var are buffers — never touched by a parameter-only EMA loop.
+    ema_model's buffers stay frozen at their post-pruning, pre-training values
+    (especially wrong for the reinitialized shared_conv's BN). Using
+    ema_model.state_dict() directly overwrites model's properly-trained BN
+    stats with these stale values, producing garbage at eval time
+    (model.eval() relies on running_mean/running_var).
+
+    Fix: take parameter values from ema_model, buffer values from model.
+    """
+    param_names = set(dict(model.named_parameters()).keys())
+    model_state = model.state_dict()
+    ema_state = ema_model.state_dict()
+    merged = {}
+    for k, v in model_state.items():
+        merged[k] = ema_state[k] if k in param_names else v
+    return merged
+
+
 def fine_tune(
     model: nn.Module,
     train_loader,
@@ -290,17 +318,19 @@ def fine_tune(
               f'lr {scheduler.get_last_lr()[0]:.2e}')
 
         # Save checkpoint after every epoch — allows early stopping at any point
+        # Merge EMA params with live BN buffers (see _merged_ema_state_dict)
+        merged_state = _merged_ema_state_dict(model, ema_model)
         ckpt_path = out_dir / f'pruned_{ratio_str}_epoch{epoch}.pth'
         torch.save({
-            'state_dict': ema_model.state_dict(),
+            'state_dict': merged_state,
             'ratio': ratio,
             'epoch': epoch,
             'loss': avg_loss,
         }, ckpt_path)
         print(f'[pruning] checkpoint saved: {ckpt_path.name}')
 
-    model.load_state_dict(ema_model.state_dict())
-    print('[pruning] EMA weights loaded for evaluation.')
+    model.load_state_dict(_merged_ema_state_dict(model, ema_model))
+    print('[pruning] EMA params + live BN buffers loaded for evaluation.')
 
 
 # ── evaluation ────────────────────────────────────────────────────────────────
@@ -325,6 +355,88 @@ def evaluate(model: nn.Module, cfg: Config) -> dict:
     return {'mAP': map_val, 'NDS': nds_val}
 
 
+def recalibrate_bn(model: nn.Module, train_loader, n_batches: int = 200) -> None:
+    """Recompute BatchNorm running stats from scratch via cumulative averaging.
+
+    Used to recover a model whose BN buffers are stale/mismatched relative to
+    its trained parameters (e.g. EMA buffer bug — see _merged_ema_state_dict).
+    Resets running_mean/running_var/num_batches_tracked, sets momentum=None
+    (cumulative average over all batches seen), then runs forward-only passes
+    in train mode so BN updates its buffers from real activation statistics.
+    No backward pass, no optimizer — only ~150-200 batches needed since the
+    conv/linear weights are already trained.
+    """
+    for m in model.modules():
+        if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+            m.reset_running_stats()
+            m.momentum = None  # cumulative moving average
+
+    model.train()
+    it = iter(train_loader)
+    with torch.no_grad():
+        for i in tqdm(range(n_batches), desc='Recalibrating BN'):
+            try:
+                batch = next(it)
+            except StopIteration:
+                it = iter(train_loader)
+                batch = next(it)
+            data = model.data_preprocessor(batch, training=True)
+            model(**data, mode='loss')
+
+    model.eval()
+    print(f'[pruning] BN recalibrated over {n_batches} batches.')
+
+
+def recalibrate_checkpoint(args: argparse.Namespace) -> None:
+    """Recover a checkpoint with stale EMA BN buffers via BN recalibration.
+
+    Rebuilds the pruned architecture (deterministic L1 pruning given the same
+    FP32 checkpoint + ratio), loads trained parameters from the broken
+    checkpoint (buffer values are ignored — ratio's shapes only matter for
+    rebuild), recalibrates BN, then evaluates and saves a corrected checkpoint.
+    """
+    cfg = Config.fromfile(args.config)
+    init_default_scope(cfg.get('default_scope', 'mmdet3d'))
+
+    print('[recalib] Rebuilding pruned architecture from FP32...')
+    model = init_model(cfg, checkpoint=args.checkpoint, device='cuda:0')
+    _set_train_cfg_from_config(model, cfg)
+
+    train_loader = build_train_loader(cfg, args.batch_size, args.num_workers, args.use_cbgs)
+    sample_batch = next(iter(train_loader))
+    bev_example = get_bev_example(model, sample_batch)
+    prune_model(model, bev_example, args.ratio)
+
+    print(f'[recalib] Loading trained weights from {args.model_path}...')
+    ckpt = torch.load(args.model_path, map_location='cuda:0')
+    state_dict = ckpt.get('state_dict', ckpt)
+    model.load_state_dict(state_dict, strict=True)
+
+    print(f'[recalib] Recalibrating BN over {args.recalib_batches} batches...')
+    recalibrate_bn(model, train_loader, args.recalib_batches)
+
+    print('[recalib] Evaluating...')
+    metrics = evaluate(model, cfg)
+    print(f'[recalib] ratio={args.ratio:.0%}  mAP {metrics["mAP"]:.4f}  '
+          f'NDS {metrics["NDS"]:.4f}')
+
+    ratio_str = f'{int(args.ratio * 100):02d}'
+    out_dir = Path(args.out) / f'ratio_{ratio_str}'
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    ckpt_path = str(out_dir / f'pruned_{ratio_str}_recalib.pth')
+    torch.save({'state_dict': model.state_dict(), 'ratio': args.ratio}, ckpt_path)
+    model_path = str(out_dir / f'pruned_model_{ratio_str}_recalib.pt')
+    torch.save(model, model_path)
+    metrics_path = str(out_dir / f'pruned_{ratio_str}_recalib_metrics.json')
+    with open(metrics_path, 'w') as f:
+        json.dump({'ratio': args.ratio, **metrics}, f, indent=2)
+
+    print(f'[recalib] Saved checkpoint: {ckpt_path}')
+    print(f'[recalib] Saved full model: {model_path}')
+    print(f'[recalib] Metrics saved to {metrics_path}')
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -334,6 +446,14 @@ def main() -> None:
         if not args.model_path:
             raise ValueError('--model-path required with --eval-only')
         eval_checkpoint(args)
+        return
+
+    if args.recalibrate:
+        if not (args.checkpoint and args.ratio is not None and args.model_path):
+            raise ValueError(
+                '--checkpoint, --ratio, and --model-path required with --recalibrate'
+            )
+        recalibrate_checkpoint(args)
         return
 
     if not args.checkpoint or args.ratio is None:
