@@ -138,7 +138,7 @@ python EdgeFusion-CenterPoint/compression/check_fakequant.py \
 | Pruned 25%           | 40.81     | 53.82     | 56.4%  | −15.2% / −9.1%  |
 | Pruned 40%           | 28.38     | 39.02     | 36.0%  | −41.0% / −34.1% |
 | Pruned 55%           | 21.49     | 31.36     | 20.3%  | −55.4% / −47.0% |
-| Distilled (25% arch) | TBD       | TBD       | 56.4%  | TBD             |
+| Distilled (25% arch) | 40.94     | 53.44     | 56.4%  | −15.0% / −9.8%  |
 
 QAT recovered +0.0002 mAP and +0.0007 NDS over PTQ — small refinements as expected
 when the architecture is already INT8-robust. The one marginally-sensitive layer
@@ -150,6 +150,12 @@ backbone+neck params) loses 15.2% relative mAP, but 40% pruning (36.0% params) l
 several rare classes (bicycle, construction_vehicle) collapse to near-zero AP and
 velocity estimation degrades severely (mAVE 1.05 vs 0.35 baseline). One-shot magnitude
 pruning hits a capacity ceiling quickly past 25% — see "Pruning Sweep" below.
+
+Distillation (same architecture/init/budget as Pruned 25%, with added teacher guidance)
+produced mAP 40.94 vs Pruned 25%'s 40.81 (+0.32%, within noise) but NDS 53.44 vs 53.82
+(−0.71%, worse) — see "Knowledge Distillation" below for the full breakdown and root-cause
+analysis. **Pruned 25% (task-loss-only) remains the practical choice** for this
+compression ratio; distillation as implemented does not change the Pareto front.
 
 ---
 
@@ -546,7 +552,75 @@ distillation needs no adapter convolution. (Feature-level distillation on the 38
 288-channel neck outputs would need one; deliberately excluded from v1 as a lower-value,
 higher-risk addition.)
 
-_(Results to be added once the run completes.)_
+### Results: no improvement over task-loss fine-tuning
+
+Run at `alpha=2000, beta=50` (tuned so each distillation term contributes roughly
+10-15% of the task loss — see "Loss weight calibration" below).
+
+| Metric | Pruned 25% (task-only) | Distilled (task + distill) | Δ                |
+| ------ | ---------------------- | -------------------------- | ---------------- |
+| mAP    | 0.4081                 | 0.4094                     | +0.0013 (+0.32%) |
+| NDS    | 0.5382                 | 0.5344                     | −0.0038 (−0.71%) |
+| mATE   | 0.3270                 | 0.3551                     | worse (+0.028)   |
+| mASE   | 0.2631                 | 0.2705                     | worse (+0.0074)  |
+| mAOE   | 0.3664                 | 0.4541                     | worse (+0.088)   |
+| mAVE   | 0.3442                 | 0.4344                     | worse (+0.090)   |
+| mAAE   | 0.1961                 | 0.1884                     | better (−0.0077) |
+
+Per-class deltas are mostly noise-level: trailer +0.016, truck +0.010, motorcycle
+−0.007, pedestrian −0.005. The two classes `L_heatmap_distill` specifically targeted
+showed **no change**: bicycle 0.034→0.035, construction_vehicle 0.059→0.059.
+
+### Expected vs. actual — by targeted dimension
+
+| Dimension                         | Pruning collapse                 | Hypothesis                                                      | Actual                      |
+| --------------------------------- | -------------------------------- | --------------------------------------------------------------- | --------------------------- |
+| bicycle / construction_vehicle AP | collapsed to 0.034 / 0.059       | `L_heatmap_distill` recovers some via teacher's soft confidence | unchanged                   |
+| mAVE / mAOE                       | 0.408 / — degraded under pruning | `L_reg_distill` recovers via confidence-weighted matching       | **worse** (+0.090 / +0.088) |
+| Overall mAP                       | 0.4081                           | +1-2 points = clean win                                         | +0.0013 (negligible)        |
+
+### Root cause analysis
+
+**`L_heatmap_distill` (dense sigmoid-MSE) is background-dominated.** The vast majority
+of the 512×512 heatmap is background, where both teacher and student already output
+near-0 — correctly. Rare-class foreground pixels (bicycle, construction_vehicle) are a
+tiny fraction of the total MSE sum. Increasing `alpha` scales the _whole_ loss
+uniformly; it doesn't selectively amplify rare-class foreground signal. This is the
+same class-imbalance problem focal loss exists to solve for the task loss — our
+distillation loss has no equivalent. A foreground-weighted or per-class heatmap
+distillation term would be needed to actually target rare classes — a magnitude change
+to `alpha` alone is unlikely to help.
+
+**`L_reg_distill` (teacher-confidence-weighted L1) likely suffers spatial misalignment.**
+The weighting uses the _teacher's_ heatmap peaks — but the student's `shared_conv` was
+reinitialized (random kaiming init, see "shared_conv rebuild" above), so its spatial
+confidence pattern can differ from the teacher's even after training. If
+teacher-confident locations don't align with GT-assigned locations, `L_reg_distill` and
+`L_task`'s regression terms can pull in different directions for the same spatial
+cells — plausibly explaining why mAVE/mAOE got _worse_ rather than moving toward the
+teacher's (better) values. A GT-location-based regression distillation (matching teacher
+outputs at GT-assigned cells, rather than teacher-confidence-weighted cells) would avoid
+this misalignment.
+
+### Loss weight calibration
+
+At `alpha=beta=1.0` (initial attempt), `hm=0.0011` and `reg=0.030` against
+`task≈25-29` — distillation contributed <0.2% of total loss, i.e. no effect. Raised to
+`alpha=2000, beta=50`, giving `alpha*hm≈1.8` (7%) and `beta*reg≈1.25` (5%) — a
+meaningful but non-dominant auxiliary signal (~12% of total loss combined). Given the
+root causes above are about loss _formulation_ rather than _magnitude_, further
+alpha/beta tuning is unlikely to flip this to a clear win without also addressing
+foreground-weighting (heatmap) and spatial alignment (regression) — noted as future work
+("distillation v2").
+
+### Conclusion
+
+At these settings, output-level distillation does not outperform task-loss-only
+fine-tuning for 25% pruning — roughly equivalent on mAP, worse on NDS/box-quality.
+**Pruned 25% (simpler, task-loss-only) remains the practical choice.** On the
+architecture Pareto chart, Distilled technically edges out Pruned 25% on mAP alone
+(+0.0013) — but given NDS is worse, this should not be read as a real improvement; the
+two are effectively the same operating point reached by different training recipes.
 
 ---
 
@@ -577,25 +651,37 @@ the values from the training config, not Autoware's defaults.
 
 ## What comes next
 
-The key finding from PTQ and sensitivity is that INT8 quantization is effectively free on
-this architecture (−0.03% mAP, all but one layer non-sensitive). The interesting
-accuracy / efficiency trade-offs come from structured pruning, where channel reduction
-creates a real accuracy budget that distillation and QAT then recover.
-
 ```
 Compression
 ├─ PTQ calibration          complete — 48.12 mAP, −0.03%
 ├─ Sensitivity analysis     complete — 1/18 nodes sensitive
 ├─ QAT fine-tuning          complete — 48.14 mAP, +0.02% over PTQ
 ├─ Structured pruning       complete — 25%/40%/55%, see Pruning Sweep above
-├─ Knowledge distillation   running — controlled comparison vs Pruned 25%
-└─ Pareto assembly          next — accuracy vs params, then vs Jetson latency/power
+├─ Knowledge distillation   complete — no improvement over Pruned 25%, see above
+└─ Pareto assembly          complete — architecture_pareto.png, deployment_pareto.png
 ```
 
-Once distillation completes, `pareto.py` assembles all variants (FP32, QAT-INT8,
-Pruned 25/40/55%, Distilled) on an accuracy-vs-params chart and shortlists 2-3 operating
-points for ONNX export and TensorRT INT8 benchmarking on Jetson Orin Nano. Based on the
-pruning curve's steep falloff past 25%, the current leading candidates are **FP32
-baseline** (INT8-safety validated via PTQ/QAT) and **Pruned 25%** — both exported to ONNX
-as standard FP32 models, with TensorRT performing the actual INT8 quantization via
-on-device calibration.
+`pareto.py` assembles all 7 variants (FP32, PTQ/QAT-INT8, Pruned 25/40/55%, Distilled) into
+two charts: an architecture Pareto (params vs mAP/NDS, all measured) and a projected
+deployment Pareto (size under TRT INT8, assuming the validated near-free INT8 factor
+extends to pruned architectures). Distilled and Pruned 25% land at effectively the same
+point (14.1% projected size, ~0.408-0.409 mAP) — distillation didn't shift the front.
+
+![Architecture Pareto](results/pareto/architecture_pareto.png)
+
+![Projected Deployment Pareto](results/pareto/deployment_pareto.png)
+
+**Next phase — Jetson deployment.** Deployment candidates from the projected Pareto:
+
+| Variant              | Projected size | mAP    | Status                         |
+| -------------------- | -------------- | ------ | ------------------------------ |
+| QAT INT8 (full arch) | 25.0%          | 0.4814 | measured (A40 FakeQuantize)    |
+| Pruned 25% FP32      | 14.1%          | 0.4081 | projected — validate on Jetson |
+| Pruned 40% FP32      | 9.0%           | 0.2838 | projected — validate on Jetson |
+| Pruned 55% FP32      | 5.1%           | 0.2149 | projected — validate on Jetson |
+
+Export FP32 baseline and `pruned_model_25_recalib.pt`/`pruned_model_40.pt`/
+`pruned_model_55.pt` to ONNX (requires adapting `export_onnx.py` to load pruned full
+model objects via `torch.load()` instead of `init_model(cfg, checkpoint)` — architecture
+differs from `cfg`), then build TRT INT8 engines using `jetson_calib` (512 samples) and
+benchmark mAP/latency/power on Jetson Orin Nano.

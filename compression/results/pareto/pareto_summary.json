@@ -1,0 +1,86 @@
+{
+  "variants": [
+    {
+      "name": "FP32 baseline",
+      "mAP": 0.4815,
+      "NDS": 0.5922,
+      "params_pct": 100.0,
+      "precision": "FP32"
+    },
+    {
+      "name": "PTQ INT8",
+      "mAP": 0.4812,
+      "NDS": 0.5903,
+      "params_pct": 100.0,
+      "precision": "INT8"
+    },
+    {
+      "name": "QAT INT8",
+      "mAP": 0.4814,
+      "NDS": 0.591,
+      "params_pct": 100.0,
+      "precision": "INT8"
+    },
+    {
+      "name": "Pruned 25%",
+      "mAP": 0.4081,
+      "NDS": 0.5382,
+      "params_pct": 56.4,
+      "precision": "FP32"
+    },
+    {
+      "name": "Pruned 40%",
+      "mAP": 0.2838,
+      "NDS": 0.3902,
+      "params_pct": 36.0,
+      "precision": "FP32"
+    },
+    {
+      "name": "Pruned 55%",
+      "mAP": 0.2149,
+      "NDS": 0.3136,
+      "params_pct": 20.3,
+      "precision": "FP32"
+    },
+    {
+      "name": "Distilled (25% arch)",
+      "mAP": 0.4094,
+      "NDS": 0.5344,
+      "params_pct": 56.4,
+      "precision": "FP32"
+    }
+  ],
+  "architecture_pareto_front": [
+    "Pruned 55%",
+    "Pruned 40%",
+    "Distilled (25% arch)",
+    "FP32 baseline"
+  ],
+  "deployment_pareto_front": [
+    {
+      "name": "Pruned 55%",
+      "size_pct": 5.075,
+      "mAP": 0.2149,
+      "projected": true
+    },
+    {
+      "name": "Pruned 40%",
+      "size_pct": 9.0,
+      "mAP": 0.2838,
+      "projected": true
+    },
+    {
+      "name": "Distilled (25% arch)",
+      "size_pct": 14.1,
+      "mAP": 0.4094,
+      "projected": true
+    },
+    {
+      "name": "QAT INT8",
+      "size_pct": 25.0,
+      "mAP": 0.4814,
+      "projected": false
+    }
+  ],
+  "int8_size_factor": 0.25
+}

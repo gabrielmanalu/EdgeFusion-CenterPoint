@@ -1,90 +1,274 @@
 """
-Accuracy / latency / power Pareto frontier.
+Pareto front assembly for the EdgeFusion-CenterPoint compression sweep.
 
-Aggregates results from all compression experiments and plots the
-accuracy vs latency Pareto frontier with power encoded as bubble size.
-The chosen operating point is annotated with the constraint budget.
+Produces two views:
+
+1. ARCHITECTURE PARETO (measured)
+   x = backbone+neck params, % of FP32 baseline — the metric pruning directly
+       controls: (1-ratio)^2 -> 25%->56.4%, 40%->36.0%, 55%->20.3%.
+   y = mAP / NDS, as measured.
+
+   FP32/PTQ/QAT all sit at x=100% (identical architecture, only precision
+   differs) — INT8's benefit isn't visible on this axis. This view answers
+   "how much does removing channels cost, independent of quantization?"
+
+2. PROJECTED DEPLOYMENT PARETO
+   x = projected size, % of FP32 baseline, ASSUMING TRT INT8 on every variant
+       (size_pct = params_pct * 0.25, i.e. INT8 = 1/4 the bytes of FP32).
+   y = mAP, as measured for the FP32-precision variant (the projection
+       assumption: INT8 is near-free, validated for the unpruned architecture
+       via PTQ/QAT — 48.12/48.14 vs 48.15 FP32 — and ASSUMED to hold for
+       pruned architectures too, since BatchNorm-after-every-conv is preserved
+       regardless of channel count).
+
+   QAT (100% arch, INT8) is plotted as measured (25% size, 0.4814 mAP) — this
+   point is real. Pruned/Distilled variants are plotted at their pruned
+   params_pct * 0.25, with mAP carried over from their FP32 measurement —
+   these points are PROJECTED, marked distinctly, and are exactly what the
+   Jetson TRT INT8 benchmark validates or refutes.
 
 Usage:
-    python compression/pareto.py \
-        --results-dir compression/results/ \
-        --latency-csv deployment/benchmarks/results/latency.csv \
-        --map-budget  47.0 \
-        --latency-budget 50.0 \
-        --power-budget 15.0
+    python EdgeFusion-CenterPoint/compression/pareto.py
 """
 
-import argparse
-# import json
+import json
 from pathlib import Path
 
-# import matplotlib.pyplot as plt
-import mlflow
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt  # noqa: E402
+
+RESULTS_DIR = Path(__file__).parent / 'results'
+PARETO_DIR = RESULTS_DIR / 'pareto'
+PARETO_DIR.mkdir(parents=True, exist_ok=True)
+
+# INT8 is 1/4 the bytes of FP32 — validated near-free for the unpruned
+# architecture (PTQ 48.12 / QAT 48.14 vs FP32 48.15). Pruned architectures
+# retain BatchNorm after every conv (the property responsible for this), so
+# the same factor is used as a PROJECTION for pruned/distilled variants,
+# pending Jetson TRT validation.
+INT8_SIZE_FACTOR = 0.25
+
+# Measured results — see compression/README.md for full derivation of each.
+VARIANTS = [
+    {'name': 'FP32 baseline', 'mAP': 0.4815, 'NDS': 0.5922,
+     'params_pct': 100.0, 'precision': 'FP32'},
+    {'name': 'PTQ INT8', 'mAP': 0.4812, 'NDS': 0.5903,
+     'params_pct': 100.0, 'precision': 'INT8'},
+    {'name': 'QAT INT8', 'mAP': 0.4814, 'NDS': 0.5910,
+     'params_pct': 100.0, 'precision': 'INT8'},
+    {'name': 'Pruned 25%', 'mAP': 0.4081, 'NDS': 0.5382,
+     'params_pct': 56.4, 'precision': 'FP32'},
+    {'name': 'Pruned 40%', 'mAP': 0.2838, 'NDS': 0.3902,
+     'params_pct': 36.0, 'precision': 'FP32'},
+    {'name': 'Pruned 55%', 'mAP': 0.2149, 'NDS': 0.3136,
+     'params_pct': 20.3, 'precision': 'FP32'},
+]
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--results-dir", default="compression/results/")
-    p.add_argument("--latency-csv", default=None)
-    p.add_argument(
-        "--map-budget", type=float, default=None, help="Minimum acceptable mAP"
+def load_distillation_result() -> None:
+    """Append distillation result if available — runs independently of this
+    script's other (final) values, since it's the only pending stage."""
+    path = RESULTS_DIR / 'distillation' / 'ratio_25' / 'distilled_25_metrics.json'
+    if not path.exists():
+        print(f'[pareto] {path} not found — distillation result omitted.')
+        return
+    with open(path) as f:
+        d = json.load(f)
+    VARIANTS.append({
+        'name': 'Distilled (25% arch)',
+        'mAP': d['mAP'], 'NDS': d['NDS'],
+        'params_pct': 56.4, 'precision': 'FP32',
+    })
+    print(f'[pareto] Distillation result loaded: mAP {d["mAP"]:.4f}  NDS {d["NDS"]:.4f}')
+
+
+def pareto_front(points: list, x_key: str, y_key: str) -> list:
+    """Return the subset of points not dominated by any other point.
+
+    A point is dominated if another point has x <= this.x AND y >= this.y,
+    with at least one strict inequality (lower size is better, higher
+    accuracy is better).
+    """
+    front = []
+    for p in points:
+        dominated = any(
+            q is not p
+            and q[x_key] <= p[x_key] and q[y_key] >= p[y_key]
+            and (q[x_key] < p[x_key] or q[y_key] > p[y_key])
+            for q in points
+        )
+        if not dominated:
+            front.append(p)
+    return sorted(front, key=lambda p: p[x_key])
+
+
+def plot_architecture_pareto(variants: list) -> list:
+    """Chart 1: measured params_pct vs mAP/NDS."""
+    front = pareto_front(variants, 'params_pct', 'mAP')
+    front_names = {p['name'] for p in front}
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    for ax, metric, title in zip(axes, ['mAP', 'NDS'], ['mAP', 'NDS']):
+        # Variants sharing the same params_pct (FP32/PTQ/QAT all at 100%)
+        # get vertically-stacked label offsets to avoid overlap.
+        seen_x = {}
+        for v in variants:
+            marker = 'o' if v['precision'] == 'FP32' else 's'
+            color = 'tab:blue' if v['name'] in front_names else 'lightgray'
+            ax.scatter(v['params_pct'], v[metric], marker=marker, s=80,
+                       color=color, edgecolors='black', zorder=3)
+            stack = seen_x.get(v['params_pct'], 0)
+            seen_x[v['params_pct']] = stack + 1
+            ax.annotate(v['name'], (v['params_pct'], v[metric]),
+                        textcoords='offset points',
+                        xytext=(8, 6 - stack * 12), fontsize=8)
+        fx = [p['params_pct'] for p in front]
+        fy = [p[metric] for p in front]
+        ax.plot(fx, fy, '--', color='tab:blue', alpha=0.5, zorder=2,
+                label='Pareto front')
+        ax.set_xlabel('Backbone+Neck Params (% of FP32)')
+        ax.set_ylabel(title)
+        ax.set_title(f'Architecture Pareto — {title} vs Params')
+        ax.set_xlim(108, 12)
+        ax.grid(alpha=0.3)
+        ax.legend(loc='lower left')
+
+    fig.suptitle(
+        'Measured: precision held fixed per variant '
+        '(FP32 \u25cb circle / INT8 \u25a1 square)'
     )
-    p.add_argument(
-        "--latency-budget",
-        type=float,
-        default=None,
-        help="Maximum acceptable p99 latency (ms)",
+    fig.tight_layout()
+    out = PARETO_DIR / 'architecture_pareto.png'
+    fig.savefig(out, dpi=120)
+    plt.close(fig)
+    print(f'[pareto] Saved {out}')
+    return front
+
+
+def plot_deployment_pareto(variants: list) -> list:
+    """Chart 2: projected size under TRT INT8 (params_pct * 0.25) vs mAP.
+
+    QAT is measured (real INT8 result). Pruned/Distilled FP32 variants are
+    PROJECTED — same mAP, size scaled by INT8_SIZE_FACTOR — marked with
+    hollow markers and "(projected)" labels.
+    """
+    points = []
+    for v in variants:
+        if v['name'] == 'QAT INT8':
+            points.append({
+                **v,
+                'size_pct': v['params_pct'] * INT8_SIZE_FACTOR,
+                'projected': False,
+            })
+        elif v['precision'] == 'FP32' and v['name'] != 'FP32 baseline':
+            points.append({
+                **v,
+                'size_pct': v['params_pct'] * INT8_SIZE_FACTOR,
+                'projected': True,
+            })
+    # FP32 baseline and PTQ excluded: FP32 isn't INT8, and PTQ is dominated
+    # by QAT at the same size with higher accuracy.
+
+    front = pareto_front(points, 'size_pct', 'mAP')
+    front_names = {p['name'] for p in front}
+
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    # Points within this (size_pct, mAP) distance get vertically-stacked
+    # label offsets to avoid overlap (e.g. Pruned 25% and Distilled sit at
+    # nearly the same projected point, ~14.1% / ~0.408-0.409).
+    placed = []
+    for p in points:
+        marker = 'D' if not p['projected'] else 'o'
+        facecolor = 'tab:blue' if p['name'] in front_names else 'lightgray'
+        if p['projected']:
+            ax.scatter(p['size_pct'], p['mAP'], marker=marker, s=80,
+                       facecolors='none', edgecolors=facecolor, linewidths=2,
+                       zorder=3)
+            label = f"{p['name']} (projected)"
+        else:
+            ax.scatter(p['size_pct'], p['mAP'], marker=marker, s=90,
+                       color=facecolor, edgecolors='black', zorder=3)
+            label = f"{p['name']} (measured)"
+
+        stack = sum(
+            1 for (px, py) in placed
+            if abs(px - p['size_pct']) < 1.5 and abs(py - p['mAP']) < 0.01
+        )
+        placed.append((p['size_pct'], p['mAP']))
+        ax.annotate(label, (p['size_pct'], p['mAP']),
+                    textcoords='offset points', xytext=(8, 6 - stack * 14),
+                    fontsize=8)
+
+    fx = [p['size_pct'] for p in front]
+    fy = [p['mAP'] for p in front]
+    ax.plot(fx, fy, '--', color='tab:blue', alpha=0.5, zorder=2,
+            label='Pareto front')
+
+    ax.set_xlabel('Projected model size under TRT INT8 (% of FP32)')
+    ax.set_ylabel('mAP')
+    ax.set_title(
+        'Projected Deployment Pareto\n'
+        '\u25c6 measured (QAT)  \u00b7  \u25cb projected '
+        '(pending Jetson validation)',
+        fontsize=10,
     )
-    p.add_argument(
-        "--power-budget", type=float, default=15.0, help="Power envelope (W)"
-    )
-    p.add_argument("--out", default="compression/results/pareto.png")
-    return p.parse_args()
-
-
-def load_all_variants(results_dir: Path) -> list:
-    """
-    Walk results_dir for experiment JSON files and build a list of
-    {name, mAP, NDS, latency_ms, power_W} dicts.
-    """
-    # TODO: discover ptq/, qat/, pruning/, distillation/ JSON files
-    raise NotImplementedError
-
-
-def is_pareto_optimal(variants: list) -> list:
-    """Return a boolean mask indicating which variants lie on the Pareto front."""
-    # TODO: standard 2-objective Pareto filtering (max mAP, min latency)
-    raise NotImplementedError
-
-
-def plot_pareto(
-    variants: list, pareto_mask: list, budgets: dict, out_path: str
-) -> None:
-    """
-    Scatter plot of mAP vs latency_ms.
-    Bubble size encodes power_W; Pareto-optimal points are highlighted.
-    Operating point (satisfies all budgets) is annotated with a star.
-    """
-    # TODO: matplotlib scatter; draw budget contour lines; annotate operating point
-    raise NotImplementedError
+    ax.set_xlim(28, 2)
+    ax.grid(alpha=0.3)
+    ax.legend(loc='upper right')
+    fig.tight_layout()
+    out = PARETO_DIR / 'deployment_pareto.png'
+    fig.savefig(out, dpi=120)
+    plt.close(fig)
+    print(f'[pareto] Saved {out}')
+    return front
 
 
 def main() -> None:
-    args = parse_args()
+    load_distillation_result()
 
-    budgets = {
-        "mAP": args.map_budget,
-        "latency": args.latency_budget,
-        "power": args.power_budget,
+    print('\n[pareto] All variants:')
+    for v in VARIANTS:
+        print(f"  {v['name']:24s}  mAP {v['mAP']:.4f}  NDS {v['NDS']:.4f}  "
+              f"params {v['params_pct']:5.1f}%  ({v['precision']})")
+
+    arch_front = plot_architecture_pareto(VARIANTS)
+    print('\n[pareto] Architecture Pareto front (params_pct vs mAP):')
+    for p in arch_front:
+        print(f"  {p['name']:24s}  {p['params_pct']:5.1f}% params  "
+              f"mAP {p['mAP']:.4f}")
+
+    deploy_front = plot_deployment_pareto(VARIANTS)
+    print('\n[pareto] Projected Deployment Pareto front (size_pct vs mAP):')
+    for p in deploy_front:
+        tag = 'measured' if not p['projected'] else 'PROJECTED'
+        print(f"  {p['name']:24s}  {p['size_pct']:5.1f}% size  "
+              f"mAP {p['mAP']:.4f}  ({tag})")
+
+    summary = {
+        'variants': VARIANTS,
+        'architecture_pareto_front': [p['name'] for p in arch_front],
+        'deployment_pareto_front': [
+            {'name': p['name'], 'size_pct': p['size_pct'],
+             'mAP': p['mAP'], 'projected': p['projected']}
+            for p in deploy_front
+        ],
+        'int8_size_factor': INT8_SIZE_FACTOR,
     }
+    summary_path = PARETO_DIR / 'pareto_summary.json'
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+    print(f'\n[pareto] Summary saved to {summary_path}')
 
-    with mlflow.start_run(run_name="pareto"):
-        variants = load_all_variants(Path(args.results_dir))
-        pareto_mask = is_pareto_optimal(variants)
-        plot_pareto(variants, pareto_mask, budgets, args.out)
-        mlflow.log_artifact(args.out)
-        print(f"[pareto] Frontier saved to {args.out}")
+    print('\n[pareto] Recommended Jetson candidates (validate projections):')
+    for p in deploy_front:
+        if p['projected']:
+            print(f"  {p['name']} — projected {p['size_pct']:.1f}% size, "
+                  f"{p['mAP']:.4f} mAP. Export pruned_model_*.pt -> ONNX -> "
+                  f"TRT INT8, benchmark on jetson_calib.")
+    print('  QAT INT8 — measured 25.0% size, 0.4814 mAP. Export FP32 '
+          'baseline -> ONNX -> TRT INT8 (validated near-free), benchmark.')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

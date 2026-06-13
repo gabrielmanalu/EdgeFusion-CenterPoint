@@ -67,13 +67,20 @@ accuracy / latency / power trade-off look like across the full Pareto front?
 | Pruned 25%           | 0.4081 | 0.5382 | 56.4%  | −15.2% |
 | Pruned 40%           | 0.2838 | 0.3902 | 36.0%  | −41.0% |
 | Pruned 55%           | 0.2149 | 0.3136 | 20.3%  | −55.4% |
-| Distilled (25% arch) | TBD    | TBD    | 56.4%  | TBD    |
+| Distilled (25% arch) | 0.4094 | 0.5344 | 56.4%  | −15.0% |
 
 INT8 quantization is essentially free on this architecture (BatchNorm normalizes
 activations before every conv, producing INT8-friendly distributions). One-shot
 magnitude pruning shows a steep, accelerating accuracy cost past 25% — see
 [`compression/README.md`](compression/README.md) for the full pruning sweep analysis,
 per-class breakdown, and the EMA/BatchNorm buffer bug + recalibration recovery.
+
+Knowledge distillation (same architecture/init/budget as Pruned 25%, with added teacher
+guidance) produced essentially the same mAP (+0.32%, within noise) but worse NDS
+(−0.71% — mAOE and mAVE both degraded). **Pruned 25% (task-loss-only) remains the
+practical choice** for this ratio; see `compression/README.md` for the full root-cause
+analysis (background-dominated heatmap distillation loss, teacher/student spatial
+misalignment in regression distillation).
 
 ### Per-class AP (FP32 baseline)
 
@@ -87,29 +94,45 @@ per-class breakdown, and the EMA/BatchNorm buffer bug + recalibration recovery.
 
 ### Per-class AP — Pruning Sweep
 
-| Class                | FP32  | Pruned 25% | Pruned 40% | Pruned 55% |
-| -------------------- | ----- | ---------- | ---------- | ---------- |
-| car                  | 0.836 | 0.806      | 0.714      | 0.634      |
-| pedestrian           | 0.761 | 0.717      | 0.601      | 0.507      |
-| bus                  | 0.605 | 0.570      | 0.424      | 0.326      |
-| barrier              | 0.596 | 0.533      | 0.319      | 0.221      |
-| traffic_cone         | 0.533 | 0.429      | 0.252      | 0.167      |
-| truck                | 0.483 | 0.415      | 0.248      | 0.137      |
-| motorcycle           | 0.416 | 0.270      | 0.144      | 0.096      |
-| trailer              | 0.326 | 0.249      | 0.109      | 0.054      |
-| bicycle              | 0.154 | 0.034      | 0.003      | 0.000      |
-| construction_vehicle | 0.107 | 0.059      | 0.024      | 0.006      |
+| Class                | FP32  | Pruned 25% | Distilled 25% | Pruned 40% | Pruned 55% |
+| -------------------- | ----- | ---------- | ------------- | ---------- | ---------- |
+| car                  | 0.836 | 0.806      | 0.804         | 0.714      | 0.634      |
+| pedestrian           | 0.761 | 0.717      | 0.712         | 0.601      | 0.507      |
+| bus                  | 0.605 | 0.570      | 0.571         | 0.424      | 0.326      |
+| barrier              | 0.596 | 0.533      | 0.534         | 0.319      | 0.221      |
+| traffic_cone         | 0.533 | 0.429      | 0.427         | 0.252      | 0.167      |
+| truck                | 0.483 | 0.415      | 0.425         | 0.248      | 0.137      |
+| motorcycle           | 0.416 | 0.270      | 0.263         | 0.144      | 0.096      |
+| trailer              | 0.326 | 0.249      | 0.265         | 0.109      | 0.054      |
+| bicycle              | 0.154 | 0.034      | 0.035         | 0.003      | 0.000      |
+| construction_vehicle | 0.107 | 0.059      | 0.059         | 0.024      | 0.006      |
+
+Distillation's per-class deltas vs Pruned 25% are mostly noise-level (trailer +0.016,
+truck +0.010, motorcycle −0.007). The two classes `L_heatmap_distill` specifically
+targeted — bicycle and construction_vehicle — show **no change**.
 
 ### Pareto Candidates (Jetson deployment — pending)
 
-| Variant                  | mAP      | Params | Latency (Jetson) | Power |
-| ------------------------ | -------- | ------ | ---------------- | ----- |
-| FP32 baseline → TRT INT8 | 0.4815\* | 100%   | TBD              | TBD   |
-| Pruned 25% → TRT INT8    | 0.4081\* | 56.4%  | TBD              | TBD   |
+Two views are assembled by `compression/pareto.py`: an **architecture Pareto**
+(measured params vs mAP/NDS) and a **projected deployment Pareto** (size under TRT
+INT8, assuming the validated near-free INT8 factor — 0.25× — extends to pruned
+architectures, pending Jetson validation).
 
-\* On-device TRT INT8 expected to closely match these FP32 numbers — quantization shown
-to be near-free for both the unpruned and pruned architectures (BatchNorm-normalized
-activations throughout). TRT calibration uses the 512-sample `jetson_calib` set.
+| Variant                    | mAP             | Projected size (TRT INT8) | Status                      | Latency | Power |
+| -------------------------- | --------------- | ------------------------- | --------------------------- | ------- | ----- |
+| QAT INT8 (full arch)       | 0.4814          | 25.0%                     | measured (A40 FakeQuantize) | TBD     | TBD   |
+| Pruned 25% / Distilled 25% | 0.4081 / 0.4094 | 14.1%                     | projected                   | TBD     | TBD   |
+| Pruned 40%                 | 0.2838          | 9.0%                      | projected                   | TBD     | TBD   |
+| Pruned 55%                 | 0.2149          | 5.1%                      | projected                   | TBD     | TBD   |
+
+Pruned 25% and Distilled land at effectively the same point (14.1% size, ~0.408-0.409
+mAP) — distillation didn't shift the Pareto front (see Compression Sweep note above).
+
+INT8 quantization shown near-free for the unpruned architecture (PTQ 0.4812 / QAT
+0.4814 vs FP32 0.4815). Pruned architectures retain BatchNorm after every conv (the
+property responsible for this), so the same factor is _projected_ for pruned variants —
+this is exactly what TRT INT8 benchmarking on Jetson Orin Nano validates next. TRT
+calibration uses the 512-sample `jetson_calib` set.
 
 ---
 
@@ -129,7 +152,8 @@ EdgeFusion-CenterPoint/
 │   ├── distillation.py
 │   ├── pareto.py
 │   ├── check_fakequant.py
-│   ├── results/           ← not in repo — see Checkpoints below
+│   ├── results/            ← checkpoints not in repo, see Checkpoints below
+│   │   └── pareto/
 │   └── README.md
 ├── docs/
 │   └── design_decisions.md
