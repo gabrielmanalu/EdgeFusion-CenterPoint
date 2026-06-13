@@ -5,6 +5,7 @@
       "mAP": 0.4815,
       "NDS": 0.5922,
       "params_pct": 100.0,
+      "full_model_pct": 100.0,
       "precision": "FP32"
     },
     {
@@ -12,6 +13,7 @@
       "mAP": 0.4812,
       "NDS": 0.5903,
       "params_pct": 100.0,
+      "full_model_pct": 100.0,
       "precision": "INT8"
     },
     {
@@ -19,6 +21,7 @@
       "mAP": 0.4814,
       "NDS": 0.591,
       "params_pct": 100.0,
+      "full_model_pct": 100.0,
       "precision": "INT8"
     },
     {
@@ -26,6 +29,7 @@
       "mAP": 0.4081,
       "NDS": 0.5382,
       "params_pct": 56.4,
+      "full_model_pct": 67.15,
       "precision": "FP32"
     },
     {
@@ -33,6 +37,7 @@
       "mAP": 0.2838,
       "NDS": 0.3902,
       "params_pct": 36.0,
+      "full_model_pct": 51.48,
       "precision": "FP32"
     },
     {
@@ -40,6 +45,7 @@
       "mAP": 0.2149,
       "NDS": 0.3136,
       "params_pct": 20.3,
+      "full_model_pct": 39.55,
       "precision": "FP32"
     },
     {
@@ -47,6 +53,7 @@
       "mAP": 0.4094,
       "NDS": 0.5344,
       "params_pct": 56.4,
+      "full_model_pct": 67.15,
       "precision": "FP32"
     }
   ],
@@ -59,19 +66,19 @@
   "deployment_pareto_front": [
     {
       "name": "Pruned 55%",
-      "size_pct": 5.075,
+      "size_pct": 9.8875,
       "mAP": 0.2149,
       "projected": true
     },
     {
       "name": "Pruned 40%",
-      "size_pct": 9.0,
+      "size_pct": 12.87,
       "mAP": 0.2838,
       "projected": true
     },
     {
       "name": "Distilled (25% arch)",
-      "size_pct": 14.1,
+      "size_pct": 16.7875,
       "mAP": 0.4094,
       "projected": true
     },

@@ -668,25 +668,42 @@ Compression
 
 `pareto.py` assembles all 7 variants (FP32, PTQ/QAT-INT8, Pruned 25/40/55%, Distilled) into
 two charts: an architecture Pareto (params vs mAP/NDS, all measured) and a projected
-deployment Pareto (size under TRT INT8, assuming the validated near-free INT8 factor
-extends to pruned architectures). Distilled and Pruned 25% land at effectively the same
-point (14.1% projected size, ~0.408-0.409 mAP) — distillation didn't shift the front.
+deployment Pareto (full-model size under TRT INT8, measured from exported ONNX file
+sizes × the validated near-free INT8 factor). Distilled and Pruned 25% land at
+effectively the same point (16.8% projected size, ~0.408-0.409 mAP, identical ONNX
+size: 16,083,947 bytes) — distillation didn't shift the front.
 
 ![Architecture Pareto](results/pareto/architecture_pareto.png)
 
 ![Projected Deployment Pareto](results/pareto/deployment_pareto.png)
 
-**Next phase — Jetson deployment.** Deployment candidates from the projected Pareto:
+**ONNX export complete** for all 5 variants (`compression/results/onnx_export/`),
+using `--synthetic-input` mode (no `/data/nuscenes/` extraction needed — random points
+within `point_cloud_range` are sufficient for tracing). Measured backbone+neck+head
+ONNX sizes:
 
-| Variant              | Projected size | mAP    | Status                         |
-| -------------------- | -------------- | ------ | ------------------------------ |
-| QAT INT8 (full arch) | 25.0%          | 0.4814 | measured (A40 FakeQuantize)    |
-| Pruned 25% FP32      | 14.1%          | 0.4081 | projected — validate on Jetson |
-| Pruned 40% FP32      | 9.0%           | 0.2838 | projected — validate on Jetson |
-| Pruned 55% FP32      | 5.1%           | 0.2149 | projected — validate on Jetson |
+| Variant                    | ONNX size (bytes) | % of FP32 | params_pct (backbone+neck) |
+| -------------------------- | ----------------- | --------- | -------------------------- |
+| FP32 baseline              | 23,950,609        | 100.0%    | 100.0%                     |
+| Pruned 25% / Distilled 25% | 16,083,947        | 67.2%     | 56.4%                      |
+| Pruned 40%                 | 12,329,623        | 51.5%     | 36.0%                      |
+| Pruned 55%                 | 9,472,899         | 39.6%     | 20.3%                      |
 
-Export FP32 baseline and `pruned_model_25_recalib.pt`/`pruned_model_40.pt`/
-`pruned_model_55.pt` to ONNX (requires adapting `export_onnx.py` to load pruned full
-model objects via `torch.load()` instead of `init_model(cfg, checkpoint)` — architecture
-differs from `cfg`), then build TRT INT8 engines using `jetson_calib` (512 samples) and
-benchmark mAP/latency/power on Jetson Orin Nano.
+Full-model % > backbone+neck params_pct in every case — `task_heads` (~1.1-1.5M
+params, fixed) become a larger fraction of the total as backbone+neck shrinks.
+Projected deployment sizes (full-model % × 0.25 INT8 factor) used in the deployment
+Pareto chart above:
+
+| Variant                    | Projected size | mAP             | Status                         |
+| -------------------------- | -------------- | --------------- | ------------------------------ |
+| QAT INT8 (full arch)       | 25.0%          | 0.4814          | measured (A40 FakeQuantize)    |
+| Pruned 25% / Distilled 25% | 16.8%          | 0.4081 / 0.4094 | projected — validate on Jetson |
+| Pruned 40%                 | 12.9%          | 0.2838          | projected — validate on Jetson |
+| Pruned 55%                 | 9.9%           | 0.2149          | projected — validate on Jetson |
+
+**Next phase — Jetson deployment.** Build TRT INT8 engines from the exported ONNX
+files using `jetson_calib` (512 samples), then benchmark mAP/latency/power on Jetson
+Orin Nano. The two practical candidates are FP32-baseline→TRT-INT8 and
+Pruned25→TRT-INT8 (see root README Pareto Candidates section); Pruned 40/55% and
+Distilled 25% ONNX are exported for Pareto completeness but unlikely to be the final
+recommendation given their accuracy levels.

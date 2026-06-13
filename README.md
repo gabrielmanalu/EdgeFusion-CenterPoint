@@ -125,8 +125,16 @@ architectures, pending Jetson validation).
 | Pruned 40%                 | 0.2838          | 9.0%                      | projected                   | TBD     | TBD   |
 | Pruned 55%                 | 0.2149          | 5.1%                      | projected                   | TBD     | TBD   |
 
-Pruned 25% and Distilled land at effectively the same point (14.1% size, ~0.408-0.409
-mAP) — distillation didn't shift the Pareto front (see Compression Sweep note above).
+ONNX export complete for all 5 variants (`compression/results/onnx_export/`). Projected
+sizes use the _full backbone+neck+head_ ONNX size (23.95MB FP32 baseline → 16.08/12.33/
+9.47MB for Pruned 25/40/55%, i.e. 67.2%/51.5%/39.6% of FP32), not the backbone+neck-only
+params ratio (56.4%/36.0%/20.3%) — `task_heads` (~1.1-1.5M params) are untouched by
+pruning, so they become a larger fraction of the total as backbone+neck shrinks. The
+gap to QAT-INT8 (25%) is narrower than the channel-ratio alone would suggest.
+
+Pruned 25% and Distilled land at effectively the same point (16.8% size, ~0.408-0.409
+mAP, exact same ONNX size: 16,083,947 bytes both) — distillation didn't shift the
+Pareto front (see Compression Sweep note above).
 
 INT8 quantization shown near-free for the unpruned architecture (PTQ 0.4812 / QAT
 0.4814 vs FP32 0.4815). Pruned architectures retain BatchNorm after every conv (the

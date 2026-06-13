@@ -50,19 +50,31 @@ PARETO_DIR.mkdir(parents=True, exist_ok=True)
 INT8_SIZE_FACTOR = 0.25
 
 # Measured results — see compression/README.md for full derivation of each.
+#
+# full_model_pct: measured from exported backbone_neck_head ONNX file sizes
+# (compression/results/onnx_export/*/pts_backbone_neck_head_centerpoint_*.onnx),
+# as % of the FP32 baseline's 23,950,609 bytes. This is HIGHER than
+# params_pct (backbone+neck channel ratio, e.g. 56.4% for Pruned 25%) because
+# task_heads (~1.1-1.5M params) are untouched by pruning — fixed overhead
+# that becomes a larger fraction of the total as backbone+neck shrinks.
+# params_pct reflects the pruning RATIO chosen (architecture Pareto);
+# full_model_pct reflects actual DEPLOYED size (deployment Pareto).
+#   Pruned 25% / Distilled: 16,083,947 bytes -> 67.15%
+#   Pruned 40%:             12,329,623 bytes -> 51.48%
+#   Pruned 55%:              9,472,899 bytes -> 39.55%
 VARIANTS = [
     {'name': 'FP32 baseline', 'mAP': 0.4815, 'NDS': 0.5922,
-     'params_pct': 100.0, 'precision': 'FP32'},
+     'params_pct': 100.0, 'full_model_pct': 100.0, 'precision': 'FP32'},
     {'name': 'PTQ INT8', 'mAP': 0.4812, 'NDS': 0.5903,
-     'params_pct': 100.0, 'precision': 'INT8'},
+     'params_pct': 100.0, 'full_model_pct': 100.0, 'precision': 'INT8'},
     {'name': 'QAT INT8', 'mAP': 0.4814, 'NDS': 0.5910,
-     'params_pct': 100.0, 'precision': 'INT8'},
+     'params_pct': 100.0, 'full_model_pct': 100.0, 'precision': 'INT8'},
     {'name': 'Pruned 25%', 'mAP': 0.4081, 'NDS': 0.5382,
-     'params_pct': 56.4, 'precision': 'FP32'},
+     'params_pct': 56.4, 'full_model_pct': 67.15, 'precision': 'FP32'},
     {'name': 'Pruned 40%', 'mAP': 0.2838, 'NDS': 0.3902,
-     'params_pct': 36.0, 'precision': 'FP32'},
+     'params_pct': 36.0, 'full_model_pct': 51.48, 'precision': 'FP32'},
     {'name': 'Pruned 55%', 'mAP': 0.2149, 'NDS': 0.3136,
-     'params_pct': 20.3, 'precision': 'FP32'},
+     'params_pct': 20.3, 'full_model_pct': 39.55, 'precision': 'FP32'},
 ]
 
 
@@ -78,7 +90,7 @@ def load_distillation_result() -> None:
     VARIANTS.append({
         'name': 'Distilled (25% arch)',
         'mAP': d['mAP'], 'NDS': d['NDS'],
-        'params_pct': 56.4, 'precision': 'FP32',
+        'params_pct': 56.4, 'full_model_pct': 67.15, 'precision': 'FP32',
     })
     print(f'[pareto] Distillation result loaded: mAP {d["mAP"]:.4f}  NDS {d["NDS"]:.4f}')
 
@@ -158,13 +170,13 @@ def plot_deployment_pareto(variants: list) -> list:
         if v['name'] == 'QAT INT8':
             points.append({
                 **v,
-                'size_pct': v['params_pct'] * INT8_SIZE_FACTOR,
+                'size_pct': v['full_model_pct'] * INT8_SIZE_FACTOR,
                 'projected': False,
             })
         elif v['precision'] == 'FP32' and v['name'] != 'FP32 baseline':
             points.append({
                 **v,
-                'size_pct': v['params_pct'] * INT8_SIZE_FACTOR,
+                'size_pct': v['full_model_pct'] * INT8_SIZE_FACTOR,
                 'projected': True,
             })
     # FP32 baseline and PTQ excluded: FP32 isn't INT8, and PTQ is dominated
@@ -176,7 +188,7 @@ def plot_deployment_pareto(variants: list) -> list:
     fig, ax = plt.subplots(figsize=(8, 5.5))
     # Points within this (size_pct, mAP) distance get vertically-stacked
     # label offsets to avoid overlap (e.g. Pruned 25% and Distilled sit at
-    # nearly the same projected point, ~14.1% / ~0.408-0.409).
+    # nearly the same projected point, ~16.8% / ~0.408-0.409).
     placed = []
     for p in points:
         marker = 'D' if not p['projected'] else 'o'
