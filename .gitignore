@@ -18,7 +18,13 @@ data/
 mlruns/
 
 # Results (tracked separately)
-compression/results/
+baseline/results/*.json
+# compression/results/: large checkpoints (.pth/.pt) not tracked, see README
+# Checkpoints section for Google Drive links. pareto/ (charts + summary,
+# small, embedded in compression/README.md) IS tracked — must use `/*` + `!`
+# rather than a bare directory pattern, or git won't descend to negate it.
+compression/results/*
+!compression/results/pareto/
 deployment/benchmarks/results/
 
 # C++ build artefacts
