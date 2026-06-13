@@ -37,10 +37,17 @@ Usage:
         --alpha 1.0 \
         --beta 1.0
 
-Eval only (after early stop):
+Eval only — full model object (no --checkpoint needed):
     python EdgeFusion-CenterPoint/compression/distillation.py \
         --config $CFG \
         --eval-only \
+        --model-path compression/results/distillation/ratio_25/distilled_model_25.pt
+
+Eval only — per-epoch state_dict checkpoint (rebuilds architecture, needs FP32):
+    python EdgeFusion-CenterPoint/compression/distillation.py \
+        --config $CFG \
+        --checkpoint $CKPT \
+        --eval-only --ratio 0.25 \
         --model-path compression/results/distillation/ratio_25/distilled_25_epoch3.pth
 """
 
@@ -398,13 +405,43 @@ def distill_train(
 # ── eval-only / main ────────────────────────────────────────────────────────────
 
 def eval_checkpoint(args: argparse.Namespace) -> None:
-    """Evaluate a saved distilled student checkpoint (.pt full model object)."""
+    """Evaluate a saved distilled student checkpoint.
+
+    Handles two formats:
+    - Full model object (distilled_model_25.pt) — load directly.
+    - Per-epoch state_dict checkpoint (distilled_25_epochN.pth, saved as
+      {'state_dict':..., 'ratio':..., 'epoch':...}) — rebuild the pruned
+      architecture from FP32 (deterministic given --checkpoint + ratio,
+      same as build_student) and load the state_dict into it.
+    """
     cfg = Config.fromfile(args.config)
     init_default_scope(cfg.get('default_scope', 'mmdet3d'))
 
-    print(f'[eval] Loading distilled model from {args.model_path}...')
-    model = torch.load(args.model_path, map_location='cuda:0')
-    model.cuda()
+    print(f'[eval] Loading from {args.model_path}...')
+    loaded = torch.load(args.model_path, map_location='cuda:0')
+
+    if isinstance(loaded, dict) and 'state_dict' in loaded:
+        ratio = loaded.get('ratio', args.ratio)
+        epoch = loaded.get('epoch', '?')
+        print(f'[eval] state_dict checkpoint (ratio={ratio:.0%}, epoch={epoch}) — '
+              f'rebuilding architecture from FP32...')
+        if not args.checkpoint:
+            raise ValueError(
+                '--checkpoint (FP32) required to rebuild architecture '
+                'for per-epoch state_dict checkpoints'
+            )
+        train_loader = build_train_loader(
+            cfg, args.batch_size, args.num_workers, args.use_cbgs
+        )
+        sample_batch = next(iter(train_loader))
+        model = init_model(cfg, checkpoint=args.checkpoint, device='cuda:0')
+        bev_example = get_bev_example(model, sample_batch)
+        prune_model(model, bev_example, ratio)
+        model.load_state_dict(loaded['state_dict'])
+    else:
+        model = loaded
+        model.cuda()
+
     _set_train_cfg_from_config(model, cfg)
 
     metrics = evaluate(model, cfg)
