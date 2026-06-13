@@ -66,7 +66,8 @@ def eval_checkpoint(args: argparse.Namespace) -> None:
     metrics = evaluate(model, cfg)
     print(f'[eval] mAP {metrics["mAP"]:.4f}  NDS {metrics["NDS"]:.4f}')
 
-    out = Path(args.model_path).with_suffix('_metrics.json')
+    p = Path(args.model_path)
+    out = p.parent / f'{p.stem}_metrics.json'
     with open(out, 'w') as f:
         json.dump(metrics, f, indent=2)
     print(f'[eval] Saved to {out}')

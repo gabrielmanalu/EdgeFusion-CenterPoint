@@ -225,8 +225,8 @@ channel selection from FP32, 5 epochs, raw dataset, batch=16. The only
 variable is the loss function:
 
 ```
-Pruned 25%:  L_task only                              → 0.4081 mAP
-Distilled:   L_task + alpha·L_heatmap + beta·L_reg    → (running)
+Pruned 25%:  L_task only                              → 0.4081 mAP, 0.5382 NDS
+Distilled:   L_task + alpha·L_heatmap + beta·L_reg    → 0.4094 mAP, 0.5344 NDS
 ```
 
 This isolates whether teacher guidance recovers pruning-induced capacity loss
@@ -259,6 +259,71 @@ where `img_feats=None`. Passing the raw return value directly to
 calling `forward_single(None)` first → `shared_conv(None)` →
 `TypeError: conv2d() received ... NoneType`. Unpack and use only `pts_feats`:
 `_, pts_feats = model.extract_feat(inputs, batch_input_metas)`.
+
+### Loss weight calibration
+
+At `alpha=beta=1.0` (initial attempt), `hm=0.0011` and `reg=0.030` against
+`task≈25-29` — distillation contributed <0.2% of total loss, effectively a
+no-op. Raised to `alpha=2000, beta=50`, giving `alpha*hm≈1.8` (7% of task) and
+`beta*reg≈1.25` (5% of task) — a meaningful but non-dominant auxiliary signal
+(~12% combined), the range run reported below.
+
+### Results: no improvement over task-loss fine-tuning
+
+| Metric | Pruned 25% (task-only) | Distilled (task+distill) | Δ                |
+| ------ | ---------------------- | ------------------------ | ---------------- |
+| mAP    | 0.4081                 | 0.4094                   | +0.0013 (+0.32%) |
+| NDS    | 0.5382                 | 0.5344                   | −0.0038 (−0.71%) |
+| mATE   | 0.3270                 | 0.3551                   | worse            |
+| mASE   | 0.2631                 | 0.2705                   | worse            |
+| mAOE   | 0.3664                 | 0.4541                   | worse (+0.088)   |
+| mAVE   | 0.3442                 | 0.4344                   | worse (+0.090)   |
+| mAAE   | 0.1961                 | 0.1884                   | better           |
+
+Per-class deltas mostly noise-level (trailer +0.016, truck +0.010, motorcycle
+−0.007). The two classes `L_heatmap_distill` specifically targeted — bicycle,
+construction_vehicle — show **no change** (0.034→0.035, 0.059→0.059).
+
+### Root cause: loss formulation, not loss magnitude
+
+**`L_heatmap_distill` is background-dominated.** Dense sigmoid-MSE over a
+512×512 heatmap is overwhelmingly background, where teacher and student
+already agree (both near-0). Rare-class foreground pixels are a tiny fraction
+of the total MSE. Scaling `alpha` amplifies the whole (background-dominated)
+loss uniformly — it doesn't selectively target rare-class signal. This is the
+same imbalance problem focal loss solves for the task loss; our distillation
+loss has no equivalent. A foreground-weighted or per-class heatmap distillation
+term is the fix — not a larger `alpha`.
+
+**`L_reg_distill` likely suffers teacher/student spatial misalignment.** The
+confidence weighting uses the _teacher's_ heatmap peaks, but the student's
+`shared_conv` was reinitialized (random kaiming init) — its spatial confidence
+pattern can differ from the teacher's even post-training. If
+teacher-confident locations don't align with GT-assigned locations,
+`L_reg_distill` and `L_task`'s regression terms pull in different directions
+for the same cells, plausibly explaining why mAVE/mAOE got _worse_ rather than
+moving toward the teacher's better values (mAVE=0.350). A GT-location-based
+regression distillation (matching teacher outputs at GT-assigned cells) would
+avoid this.
+
+Given both root causes are about _formulation_, further alpha/beta tuning is
+unlikely to produce a clear win — noted as "distillation v2" future work
+(foreground-weighted heatmap term, GT-aligned regression term).
+
+### Conclusion
+
+At these settings, output-level distillation does not outperform task-loss-only
+fine-tuning for 25% pruning — roughly equivalent on mAP, worse on NDS/box
+quality. **Pruned 25% (task-loss-only) remains the practical choice.**
+Distilled technically edges Pruned 25% on mAP alone (+0.0013) on the
+architecture Pareto chart, but given NDS is worse, the two should be read as
+the same operating point reached by different recipes — not a real
+improvement.
+
+Checked the epoch3 checkpoint (mAP 0.3758, NDS 0.5086) for an earlier-epoch
+sweet spot before reg-distillation's effect compounded — substantially worse
+than epoch5 (−0.0336 mAP, −0.0258 NDS). Epoch5 is the representative best
+checkpoint; no early-stopping benefit found.
 
 All compression runs are tracked in a local MLflow server for reproducibility
 and Pareto construction. Run naming convention is in `mlflow/README.md`.

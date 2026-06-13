@@ -622,6 +622,11 @@ architecture Pareto chart, Distilled technically edges out Pruned 25% on mAP alo
 (+0.0013) — but given NDS is worse, this should not be read as a real improvement; the
 two are effectively the same operating point reached by different training recipes.
 
+Checked the epoch3 checkpoint (mAP 0.3758, NDS 0.5086) for an earlier-epoch sweet spot
+before reg-distillation's effect compounded — substantially worse than epoch5
+(−0.0336 mAP, −0.0258 NDS), confirming epoch5 is the representative best checkpoint,
+not degraded by over-training. No early-stopping benefit found.
+
 ---
 
 ## Comparison with Autoware's Deployed Model
