@@ -12,6 +12,7 @@ build/
 *.onnx
 *.engine
 *.trt
+*.npy
 data/
 
 # MLflow

@@ -1,0 +1,90 @@
+# ============================================================================
+# EdgeFusion-CenterPoint — Jetson Docker Compose
+# ============================================================================
+#
+# Prerequisites:
+#   sudo jetson_clocks          ← lock GPU to max clock BEFORE benchmarking
+#   docker build -t edgefusion-centerpoint:latest -f deployment/docker/Dockerfile .
+#
+# Usage:
+#   docker compose -f deployment/docker/docker-compose.yml run --rm dev
+#   docker compose -f deployment/docker/docker-compose.yml run --rm build-engines
+#   docker compose -f deployment/docker/docker-compose.yml run --rm benchmark
+#
+# Volumes:
+#   onnx/      — compression/results/onnx_export/{variant}/*.onnx (read-only)
+#   calib/     — jetson_calib/ (512 raw .pcd.bin point clouds, for eval.py)
+#   calib_bev/ — jetson_calib_bev/ (512 precomputed [64,512,512] BEV tensors,
+#                generated on the pod via compression/generate_calib_bev.py —
+#                used by build_engine.py's INT8 calibrator)
+#   output/    — built .engine files + benchmark/eval results
+#
+# Note on jetson_clocks: must be run on the HOST before docker run — it
+# affects hardware clocks, not the container environment. The container
+# inherits host clock state. Without it, GPU idles at low clock and
+# latency numbers won't reflect the 15W performance mode.
+# ============================================================================
+
+name: edgefusion-centerpoint
+
+x-base: &base
+  image: edgefusion-centerpoint:latest
+  build:
+    context: ../..
+    dockerfile: deployment/docker/Dockerfile
+  runtime: nvidia
+  environment:
+    - NVIDIA_VISIBLE_DEVICES=all
+    - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+  network_mode: host
+  restart: "no"
+  volumes:
+    - ../../compression/results/onnx_export:/workspace/onnx:ro
+    - ../../jetson_calib:/workspace/calib:ro
+    - ../../jetson_calib_bev:/workspace/calib_bev:ro
+    - ../scripts:/workspace/scripts:ro
+    - ../output:/workspace/output
+
+services:
+
+  # ── Build TRT INT8 engines from ONNX + calibration data ───────────────────
+  build-engines:
+    <<: *base
+    command: >
+      python3 scripts/build_engine.py
+      --onnx-dir /workspace/onnx
+      --calib-dir /workspace/calib_bev
+      --out /workspace/output/engines
+      --variant ${VARIANT:-fp32}
+
+  # ── Benchmark latency/power for a built engine ────────────────────────────
+  benchmark:
+    <<: *base
+    command: >
+      python3 scripts/benchmark.py
+      --engine /workspace/output/engines/${VARIANT:-fp32}/pts_backbone_neck_head.engine
+      --duration ${DURATION:-60}
+      --out /workspace/output/benchmark_${VARIANT:-fp32}.json
+
+  # ── On-device mAP/NDS eval ────────────────────────────────────────────────
+  eval:
+    <<: *base
+    volumes:
+      - ../../compression/results/onnx_export:/workspace/onnx:ro
+      - ../../jetson_calib:/workspace/calib:ro
+      - ../scripts:/workspace/scripts:ro
+      - ../output:/workspace/output
+      - ${NUSCENES_VAL:-../../data/nuscenes}:/workspace/nuscenes:ro
+    command: >
+      python3 scripts/eval.py
+      --engine /workspace/output/engines/${VARIANT:-fp32}/pts_backbone_neck_head.engine
+      --encoder-engine /workspace/output/engines/${VARIANT:-fp32}/pts_voxel_encoder.engine
+      --nuscenes /workspace/nuscenes
+      --out /workspace/output/eval_${VARIANT:-fp32}.json
+
+  # ── Interactive development shell ─────────────────────────────────────────
+  dev:
+    <<: *base
+    command: bash
+    stdin_open: true
+    tty: true
