@@ -42,39 +42,57 @@ RESULTS_DIR = Path(__file__).parent / 'results'
 PARETO_DIR = RESULTS_DIR / 'pareto'
 PARETO_DIR.mkdir(parents=True, exist_ok=True)
 
-# INT8 is 1/4 the bytes of FP32 — validated near-free for the unpruned
-# architecture (PTQ 48.12 / QAT 48.14 vs FP32 48.15). Pruned architectures
-# retain BatchNorm after every conv (the property responsible for this), so
-# the same factor is used as a PROJECTION for pruned/distilled variants,
-# pending Jetson TRT validation.
-INT8_SIZE_FACTOR = 0.25
+# Real TRT INT8 backbone+neck+head engine sizes, measured on Jetson Orin Nano
+# (JetPack R36.4.0, TRT 10.3.0, INT8 with FP16 fallback, 512-sample entropy
+# calibration). Stored as % of fp32 engine (6.82 MB).
+# These replace the earlier ONNX-size × 0.25 projections — real values differ
+# because TRT engines include fixed-overhead metadata, per-layer calibration
+# tables, and kernel binaries regardless of model size, so the compression
+# ratio is not a flat 4×:
+#   fp32:       6.82 MB  (100.0%)  — reference
+#   pruned25:   4.90 MB  ( 71.85%)
+#   pruned40:   4.35 MB  ( 63.78%)
+#   pruned55:   3.46 MB  ( 50.73%)
+#   distilled25:4.92 MB  ( 72.14%)
+# QAT INT8: not yet benchmarked on Jetson — using fp32 engine size as proxy
+# (same architecture, so engine size should be equal).
+TRT_ENGINE_MB = {
+    'FP32 baseline': 6.82,
+    'PTQ INT8': 6.82,  # same arch as FP32, proxy
+    'QAT INT8': 6.82,  # same arch as FP32, proxy
+    'Pruned 25%': 4.90,
+    'Pruned 40%': 4.35,
+    'Pruned 55%': 3.46,
+    'Distilled (25% arch)': 4.92,
+}
+FP32_ENGINE_MB = TRT_ENGINE_MB['FP32 baseline']
 
 # Measured results — see compression/README.md for full derivation of each.
 #
-# full_model_pct: measured from exported backbone_neck_head ONNX file sizes
-# (compression/results/onnx_export/*/pts_backbone_neck_head_centerpoint_*.onnx),
-# as % of the FP32 baseline's 23,950,609 bytes. This is HIGHER than
-# params_pct (backbone+neck channel ratio, e.g. 56.4% for Pruned 25%) because
-# task_heads (~1.1-1.5M params) are untouched by pruning — fixed overhead
-# that becomes a larger fraction of the total as backbone+neck shrinks.
-# params_pct reflects the pruning RATIO chosen (architecture Pareto);
-# full_model_pct reflects actual DEPLOYED size (deployment Pareto).
-#   Pruned 25% / Distilled: 16,083,947 bytes -> 67.15%
-#   Pruned 40%:             12,329,623 bytes -> 51.48%
-#   Pruned 55%:              9,472,899 bytes -> 39.55%
+# params_pct: backbone+neck channel ratio (architecture Pareto x-axis).
+# full_model_pct: full ONNX size as % of FP32 baseline (context only — the
+#   deployment Pareto now uses trt_engine_pct from real Jetson measurements).
+# trt_engine_pct: real TRT INT8 backbone+neck+head engine size as % of FP32
+#   engine — the correct deployment x-axis.
 VARIANTS = [
     {'name': 'FP32 baseline', 'mAP': 0.4815, 'NDS': 0.5922,
-     'params_pct': 100.0, 'full_model_pct': 100.0, 'precision': 'FP32'},
+     'params_pct': 100.0, 'full_model_pct': 100.0, 'precision': 'FP32',
+     'trt_engine_pct': 100.0},
     {'name': 'PTQ INT8', 'mAP': 0.4812, 'NDS': 0.5903,
-     'params_pct': 100.0, 'full_model_pct': 100.0, 'precision': 'INT8'},
+     'params_pct': 100.0, 'full_model_pct': 100.0, 'precision': 'INT8',
+     'trt_engine_pct': 100.0},
     {'name': 'QAT INT8', 'mAP': 0.4814, 'NDS': 0.5910,
-     'params_pct': 100.0, 'full_model_pct': 100.0, 'precision': 'INT8'},
+     'params_pct': 100.0, 'full_model_pct': 100.0, 'precision': 'INT8',
+     'trt_engine_pct': 100.0},
     {'name': 'Pruned 25%', 'mAP': 0.4081, 'NDS': 0.5382,
-     'params_pct': 56.4, 'full_model_pct': 67.15, 'precision': 'FP32'},
+     'params_pct': 56.4, 'full_model_pct': 67.15, 'precision': 'FP32',
+     'trt_engine_pct': 71.85},
     {'name': 'Pruned 40%', 'mAP': 0.2838, 'NDS': 0.3902,
-     'params_pct': 36.0, 'full_model_pct': 51.48, 'precision': 'FP32'},
+     'params_pct': 36.0, 'full_model_pct': 51.48, 'precision': 'FP32',
+     'trt_engine_pct': 63.78},
     {'name': 'Pruned 55%', 'mAP': 0.2149, 'NDS': 0.3136,
-     'params_pct': 20.3, 'full_model_pct': 39.55, 'precision': 'FP32'},
+     'params_pct': 20.3, 'full_model_pct': 39.55, 'precision': 'FP32',
+     'trt_engine_pct': 50.73},
 ]
 
 
@@ -91,6 +109,7 @@ def load_distillation_result() -> None:
         'name': 'Distilled (25% arch)',
         'mAP': d['mAP'], 'NDS': d['NDS'],
         'params_pct': 56.4, 'full_model_pct': 67.15, 'precision': 'FP32',
+        'trt_engine_pct': 72.14,
     })
     print(f'[pareto] Distillation result loaded: mAP {d["mAP"]:.4f}  NDS {d["NDS"]:.4f}')
 
@@ -161,22 +180,23 @@ def plot_architecture_pareto(variants: list) -> list:
 def plot_deployment_pareto(variants: list) -> list:
     """Chart 2: projected size under TRT INT8 (params_pct * 0.25) vs mAP.
 
-    QAT is measured (real INT8 result). Pruned/Distilled FP32 variants are
-    PROJECTED — same mAP, size scaled by INT8_SIZE_FACTOR — marked with
-    hollow markers and "(projected)" labels.
+    QAT is the only A40-measured INT8 result. Pruned/Distilled variants use
+    real TRT INT8 engine sizes measured on Jetson Orin Nano (trt_engine_pct),
+    mAP carried from their FP32 eval — marked with hollow markers and
+    "(Jetson TRT)" labels. FP32 baseline and PTQ are excluded (not INT8).
     """
     points = []
     for v in variants:
         if v['name'] == 'QAT INT8':
             points.append({
                 **v,
-                'size_pct': v['full_model_pct'] * INT8_SIZE_FACTOR,
+                'size_pct': v['trt_engine_pct'],
                 'projected': False,
             })
         elif v['precision'] == 'FP32' and v['name'] != 'FP32 baseline':
             points.append({
                 **v,
-                'size_pct': v['full_model_pct'] * INT8_SIZE_FACTOR,
+                'size_pct': v['trt_engine_pct'],
                 'projected': True,
             })
     # FP32 baseline and PTQ excluded: FP32 isn't INT8, and PTQ is dominated
@@ -188,7 +208,7 @@ def plot_deployment_pareto(variants: list) -> list:
     fig, ax = plt.subplots(figsize=(8, 5.5))
     # Points within this (size_pct, mAP) distance get vertically-stacked
     # label offsets to avoid overlap (e.g. Pruned 25% and Distilled sit at
-    # nearly the same projected point, ~16.8% / ~0.408-0.409).
+    # nearly the same point ~72% / ~0.408-0.409).
     placed = []
     for p in points:
         marker = 'D' if not p['projected'] else 'o'
@@ -197,7 +217,7 @@ def plot_deployment_pareto(variants: list) -> list:
             ax.scatter(p['size_pct'], p['mAP'], marker=marker, s=80,
                        facecolors='none', edgecolors=facecolor, linewidths=2,
                        zorder=3)
-            label = f"{p['name']} (projected)"
+            label = f"{p['name']} (Jetson TRT)"
         else:
             ax.scatter(p['size_pct'], p['mAP'], marker=marker, s=90,
                        color=facecolor, edgecolors='black', zorder=3)
@@ -217,15 +237,15 @@ def plot_deployment_pareto(variants: list) -> list:
     ax.plot(fx, fy, '--', color='tab:blue', alpha=0.5, zorder=2,
             label='Pareto front')
 
-    ax.set_xlabel('Projected model size under TRT INT8 (% of FP32)')
+    ax.set_xlabel('TRT INT8 engine size (% of FP32 engine, 6.82 MB = 100%)')
     ax.set_ylabel('mAP')
     ax.set_title(
-        'Projected Deployment Pareto\n'
-        '\u25c6 measured (QAT)  \u00b7  \u25cb projected '
-        '(pending Jetson validation)',
+        'Deployment Pareto — Real TRT INT8 Engine Sizes (Jetson Orin Nano)\n'
+        '\u25c6 A40 measured (QAT)  \u00b7  '
+        '\u25cb Jetson TRT engine (mAP from FP32 eval)',
         fontsize=10,
     )
-    ax.set_xlim(28, 2)
+    ax.set_xlim(108, 44)
     ax.grid(alpha=0.3)
     ax.legend(loc='upper right')
     fig.tight_layout()
@@ -265,7 +285,7 @@ def main() -> None:
              'mAP': p['mAP'], 'projected': p['projected']}
             for p in deploy_front
         ],
-        'int8_size_factor': INT8_SIZE_FACTOR,
+        'fp32_engine_mb': FP32_ENGINE_MB,
     }
     summary_path = PARETO_DIR / 'pareto_summary.json'
     with open(summary_path, 'w') as f:
