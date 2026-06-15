@@ -58,7 +58,15 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip && \
 # Needs CUDA toolkit headers (nvcc, cuda.h) — present in l4t-jetpack at
 # /usr/local/cuda. Build from source on ARM can take several minutes.
 ENV PATH="/usr/local/cuda/bin:${PATH}"
-RUN python3 -m pip install --no-cache-dir pycuda
+RUN python3 -m pip install --no-cache-dir pycuda "numpy<2"
+
+# Packages needed by nuscenes-devkit DetectionEval that were missing from
+# the cached pip layer. Separate RUN so Docker re-executes this on rebuild
+# without invalidating the slow pycuda build layer above.
+RUN python3 -m pip install --no-cache-dir \
+        scikit-learn \
+        shapely \
+        "numpy<2"
 
 WORKDIR /workspace
 

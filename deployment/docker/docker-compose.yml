@@ -3,26 +3,31 @@
 # ============================================================================
 #
 # Prerequisites:
-#   sudo jetson_clocks          ← lock GPU to max clock BEFORE benchmarking
+#   sudo jetson_clocks          <- lock GPU to max clock BEFORE benchmarking
 #   docker build -t edgefusion-centerpoint:latest -f deployment/docker/Dockerfile .
 #
 # Usage:
 #   docker compose -f deployment/docker/docker-compose.yml run --rm dev
 #   docker compose -f deployment/docker/docker-compose.yml run --rm build-engines
-#   docker compose -f deployment/docker/docker-compose.yml run --rm benchmark
+#   VARIANT=pruned25 docker compose ... run --rm benchmark
+#   VARIANT=pruned25 docker compose ... run --rm eval
 #
 # Volumes:
 #   onnx/      — compression/results/onnx_export/{variant}/*.onnx (read-only)
-#   calib/     — jetson_calib/ (512 raw .pcd.bin point clouds, for eval.py)
-#   calib_bev/ — jetson_calib_bev/ (512 precomputed [64,512,512] BEV tensors,
-#                generated on the pod via compression/generate_calib_bev.py —
-#                used by build_engine.py's INT8 calibrator)
+#   calib/     — jetson_calib/ (512 raw .pcd.bin point clouds)
+#   calib_bev/ — jetson_calib_bev/ (512 precomputed [64,512,512] BEV .npy
+#                tensors, generated on pod via compression/generate_calib_bev.py)
 #   output/    — built .engine files + benchmark/eval results
 #
 # Note on jetson_clocks: must be run on the HOST before docker run — it
 # affects hardware clocks, not the container environment. The container
 # inherits host clock state. Without it, GPU idles at low clock and
 # latency numbers won't reflect the 15W performance mode.
+#
+# Note on tegrastats: mounted from host (/usr/bin/tegrastats) into the
+# benchmark container for power monitoring. No sudo needed — tegrastats reads
+# the INA3221 power rails (VDD_CPU_GPU_CV, VDD_IN) that are accessible
+# to the running user on Jetson.
 # ============================================================================
 
 name: edgefusion-centerpoint
@@ -58,27 +63,42 @@ services:
       --variant ${VARIANT:-fp32}
 
   # ── Benchmark latency/power for a built engine ────────────────────────────
+  # Power monitoring via tegrastats (mounted from host).
+  # Run sudo jetson_clocks on the HOST before benchmarking.
   benchmark:
     <<: *base
+    volumes:
+      - ../../compression/results/onnx_export:/workspace/onnx:ro
+      - ../../jetson_calib_bev:/workspace/calib_bev:ro
+      - ../scripts:/workspace/scripts:ro
+      - ../output:/workspace/output
+      - /usr/bin/tegrastats:/usr/bin/tegrastats:ro
     command: >
       python3 scripts/benchmark.py
       --engine /workspace/output/engines/${VARIANT:-fp32}/pts_backbone_neck_head.engine
-      --duration ${DURATION:-60}
+      --calib-bev /workspace/calib_bev
+      --iterations ${ITERATIONS:-200}
       --out /workspace/output/benchmark_${VARIANT:-fp32}.json
 
   # ── On-device mAP/NDS eval ────────────────────────────────────────────────
+  # Requires nuScenes annotation JSONs (v1.0-trainval/, ~400 MB metadata only)
+  # mounted at NUSCENES_VAL. No sensor data (images/lidar) needed for eval.
+  # Also needs nuscenes_infos_val.pkl at VAL_PKL (default: repo root).
   eval:
     <<: *base
     volumes:
       - ../../compression/results/onnx_export:/workspace/onnx:ro
+      - ../../jetson_calib_bev:/workspace/calib_bev:ro
       - ../../jetson_calib:/workspace/calib:ro
       - ../scripts:/workspace/scripts:ro
       - ../output:/workspace/output
       - ${NUSCENES_VAL:-../../data/nuscenes}:/workspace/nuscenes:ro
+      - ${VAL_PKL:-../../nuscenes_infos_val.pkl}:/workspace/nuscenes_infos_val.pkl:ro
     command: >
       python3 scripts/eval.py
       --engine /workspace/output/engines/${VARIANT:-fp32}/pts_backbone_neck_head.engine
-      --encoder-engine /workspace/output/engines/${VARIANT:-fp32}/pts_voxel_encoder.engine
+      --calib-bev /workspace/calib_bev
+      --val-pkl /workspace/nuscenes_infos_val.pkl
       --nuscenes /workspace/nuscenes
       --out /workspace/output/eval_${VARIANT:-fp32}.json
 
