@@ -38,9 +38,35 @@ from pathlib import Path
 import numpy as np
 import torch
 from mmdet3d.apis import init_model
-from mmdet3d.datasets.transforms import Compose
+try:
+    from mmdet3d.datasets.transforms import Compose
+except ImportError:
+    try:
+        from mmcv.transforms import Compose
+    except ImportError:
+        from mmengine.dataset import Compose
 from mmdet3d.structures import Det3DDataSample, LiDARInstance3DBoxes
 from mmengine.config import Config
+
+
+def _resolve_lidar_path(data_root: str, raw_path: str) -> str:
+    """Resolve a pkl-stored lidar path (often a bare filename) against the
+    actual nuScenes folder layout. Tries, in order: the raw path as-is
+    relative to data_root (in case it already includes subdirs), then
+    samples/LIDAR_TOP/<name>, then sweeps/LIDAR_TOP/<name>. Returns the first
+    that exists on disk; falls back to the as-is join (so a clear FileNotFound
+    error surfaces downstream rather than a silent wrong guess).
+    """
+    name = Path(raw_path).name
+    candidates = [
+        Path(data_root) / raw_path,
+        Path(data_root) / 'samples' / 'LIDAR_TOP' / name,
+        Path(data_root) / 'sweeps' / 'LIDAR_TOP' / name,
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return str(candidates[0])
 
 
 def main() -> None:
@@ -102,19 +128,24 @@ def main() -> None:
     n_ok = 0
     for i, info in enumerate(infos):
         # data_root must be injected so LoadPointsFromFile/MultiSweeps can
-        # resolve relative paths in the info dict.
+        # resolve paths in the info dict. The pkl stores BARE FILENAMES (not
+        # the full samples/LIDAR_TOP/... relative path), so we resolve against
+        # the actual nuScenes folder layout: keyframes live under
+        # samples/LIDAR_TOP/, sweep frames under sweeps/LIDAR_TOP/. Try both
+        # locations (order matters: samples first since the keyframe itself
+        # sometimes appears as the first "sweep" entry too).
         info_in = dict(info)
         info_in['lidar_points'] = dict(info['lidar_points'])
-        info_in['lidar_points']['lidar_path'] = str(
-            Path(args.data_root) / info['lidar_points']['lidar_path']
+        info_in['lidar_points']['lidar_path'] = _resolve_lidar_path(
+            args.data_root, info['lidar_points']['lidar_path']
         )
         if 'lidar_sweeps' in info_in:
             sweeps = []
             for sw in info_in['lidar_sweeps']:
                 sw = dict(sw)
                 sw['lidar_points'] = dict(sw['lidar_points'])
-                sw['lidar_points']['lidar_path'] = str(
-                    Path(args.data_root) / sw['lidar_points']['lidar_path']
+                sw['lidar_points']['lidar_path'] = _resolve_lidar_path(
+                    args.data_root, sw['lidar_points']['lidar_path']
                 )
                 sweeps.append(sw)
             info_in['lidar_sweeps'] = sweeps
@@ -136,7 +167,20 @@ def main() -> None:
 
         with torch.no_grad():
             pre = model.data_preprocessor(batch, training=False)
-            model.extract_feat(pre['inputs'])  # fires hook
+            # extract_feat signature varies across mmdet3d versions; the hook
+            # on pts_middle_encoder fires regardless of which path runs, so we
+            # just need the call to complete. Try the known signatures.
+            metas = [ds.metainfo]
+            try:
+                model.extract_feat(pre['inputs'], metas)
+            except TypeError:
+                try:
+                    model.extract_feat(
+                        batch_inputs_dict=pre['inputs'],
+                        batch_input_metas=metas,
+                    )
+                except TypeError:
+                    model.extract_feat(pre['inputs'])  # oldest signature
 
         bev = captured['bev']
 
