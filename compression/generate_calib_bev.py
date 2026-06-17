@@ -1,144 +1,171 @@
 """
-Generate [64,512,512] BEV calibration tensors for TRT INT8 calibration of the
-backbone+neck+head engine, from raw nuScenes point clouds in jetson_calib/
-(each a .pcd.bin file, float32, point_dim columns).
+Generate VERIFIED [64,512,512] BEV calibration tensors.
 
-Runs voxelize() -> pts_voxel_encoder() -> pts_middle_encoder() on the FP32
-model for each raw point cloud — the exact validated pipeline from
-baseline/export_onnx.py's compute_bev_features(), duplicated here unmodified.
-This avoids reimplementing PFN feature augmentation (cluster/voxel-center
-offsets) in numpy on Jetson, which carries silent-miscalibration risk if the
-augmentation formula is gotten wrong.
+ROOT CAUSE FOUND: CenterPoint config uses
+LoadPointsFromMultiSweeps(sweeps_num=9) — the model expects 9 past sweeps
+aggregated with the current frame (~10 LiDAR frames, motion-compensated) for
+each sample, NOT a single raw scan. jetson_calib/ contains single-sweep .bin
+files, which are far too sparse for this model, producing weak/noisy heatmaps
+regardless of how correctly voxelization+encoding+scatter are implemented.
 
-Output: one [64,512,512] float32 .npy per input .pcd.bin, written to --out.
-Feeds directly into deployment/scripts/build_engine.py's BEVFeatureCalibrator.
+fix: use the REAL test pipeline (built straight from the config) on
+samples drawn from the actual nuscenes_infos_val.pkl, which is what supplies
+the multi-sweep metadata (sweep file paths + relative timestamps/ego poses)
+that LoadPointsFromMultiSweeps needs. This is exactly how mmdet3d's own
+test.py evaluates the model — guaranteed-correct by construction, since we
+are no longer hand-assembling any part of the input pipeline.
 
-Size note: 512 samples x 64x512x512x4 bytes ~= 8.6GB total (~16.8MB/sample).
-Use --max-samples to generate a subset if transfer bandwidth to Jetson is a
-concern — TRT INT8 entropy calibration commonly converges well within 100-200
-samples; 512 is on the high end.
+Requires: the nuScenes raw sweep .bin files referenced by each info's
+'lidar_sweeps' to be present at the path the pkl expects (typically under
+data/nuscenes/sweeps/LIDAR_TOP/ relative to the dataset root used when the
+pkl was generated). If sweeps aren't available, this won't run — see the
+fallback note in the script output.
 
-Usage (from /workspace/mmdetection3d, after source activate_env.sh):
+Usage (on pod, from mmdetection3d/, after source activate_env.sh):
     python EdgeFusion-CenterPoint/compression/generate_calib_bev.py \
         --config $CFG --checkpoint $CKPT \
-        --calib-dir EdgeFusion-CenterPoint/jetson_calib \
-        --out EdgeFusion-CenterPoint/jetson_calib_bev \
-        --max-samples 200
+        --val-pkl /path/to/nuscenes_infos_val.pkl \
+        --data-root /workspace/data/nuscenes \
+        --tokens-file EdgeFusion-CenterPoint/jetson_calib_tokens.txt \
+        --out /data/jetson_calib_bev \
+        --verify-n 5
 """
 
 import argparse
+import pickle
 from pathlib import Path
 
 import numpy as np
 import torch
 from mmdet3d.apis import init_model
-from mmdet3d.structures import Det3DDataSample
+from mmdet3d.datasets.transforms import Compose
+from mmdet3d.structures import Det3DDataSample, LiDARInstance3DBoxes
 from mmengine.config import Config
 
 
-def _infer_point_dim(cfg: Config) -> int:
-    """Infer raw point feature dim from LoadPointsFromFile's use_dim/load_dim.
-
-    Same logic as baseline/export_onnx.py — duplicated here to keep this
-    script self-contained (avoids cross-directory import path issues when
-    invoked as EdgeFusion-CenterPoint/compression/<script>.py).
-    """
-    pipelines = []
-    if 'test_pipeline' in cfg:
-        pipelines.append(cfg.test_pipeline)
-    try:
-        pipelines.append(cfg.test_dataloader.dataset.pipeline)
-    except (KeyError, AttributeError):
-        pass
-
-    for pipeline in pipelines:
-        for transform in pipeline:
-            if transform.get('type') == 'LoadPointsFromFile':
-                use_dim = transform.get('use_dim', transform.get('load_dim', 5))
-                return use_dim if isinstance(use_dim, int) else len(use_dim)
-    return 5
-
-
-def compute_bev_features(model, voxel_dict: dict) -> torch.Tensor:
-    """Run encoder + pillar scatter -> BEV pseudo-image [B, 64, H, W].
-
-    Identical to baseline/export_onnx.py's compute_bev_features — duplicated
-    here for the same self-containment reason as _infer_point_dim above.
-    """
-    with torch.no_grad():
-        pillar_feats = model.pts_voxel_encoder(
-            voxel_dict['voxels'].cuda(),
-            voxel_dict['num_points'].cuda(),
-            voxel_dict['coors'].cuda(),
-        ).squeeze()
-        batch_size = int(voxel_dict['coors'][-1, 0].item()) + 1
-        bev = model.pts_middle_encoder(
-            pillar_feats, voxel_dict['coors'].cuda(), batch_size
-        )
-    return bev
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description='Generate BEV calibration tensors for TRT INT8'
-    )
-    p.add_argument('--config', required=True)
-    p.add_argument('--checkpoint', required=True, help='FP32 .pth checkpoint')
-    p.add_argument(
-        '--calib-dir', required=True,
-        help='Directory of raw .pcd.bin point clouds (jetson_calib/)'
-    )
-    p.add_argument(
-        '--out', required=True,
-        help='Output directory for [64,512,512] .npy files'
-    )
-    p.add_argument(
-        '--max-samples', type=int, default=None,
-        help='Process only the first N files (default: all). See size note '
-             'in module docstring re: transfer bandwidth to Jetson.'
-    )
-    return p.parse_args()
-
-
 def main() -> None:
-    args = parse_args()
-    cfg = Config.fromfile(args.config)
-    point_dim = _infer_point_dim(cfg)
-    print(f'[calib-bev] point_dim={point_dim}')
+    p = argparse.ArgumentParser()
+    p.add_argument('--config', required=True)
+    p.add_argument('--checkpoint', required=True)
+    p.add_argument(
+        '--val-pkl', required=True,
+        help='nuscenes_infos_val.pkl (supplies multi-sweep metadata)'
+    )
+    p.add_argument(
+        '--data-root', required=True,
+        help='nuScenes dataset root containing samples/ and sweeps/'
+    )
+    p.add_argument(
+        '--tokens-file', default=None,
+        help='Optional: text file of sample tokens (one per line) to '
+             'restrict to — e.g. the 512 jetson_calib tokens. If omitted, '
+             'uses --max-samples from the start of the val pkl.'
+    )
+    p.add_argument('--max-samples', type=int, default=512)
+    p.add_argument('--out', required=True)
+    p.add_argument('--verify-n', type=int, default=5)
+    args = p.parse_args()
 
+    cfg = Config.fromfile(args.config)
     model = init_model(cfg, args.checkpoint, device='cuda:0')
     model.eval()
 
-    files = sorted(Path(args.calib_dir).glob('*.bin'))
-    if not files:
-        raise FileNotFoundError(f'No .bin files found in {args.calib_dir}')
-    if args.max_samples:
-        files = files[:args.max_samples]
-    print(f'[calib-bev] {len(files)} point clouds from {args.calib_dir}')
+    # Build the REAL test pipeline straight from the config — this includes
+    # LoadPointsFromFile + LoadPointsFromMultiSweeps + everything else,
+    # exactly as used during the model's actual evaluation.
+    pipeline = Compose(cfg.test_dataloader.dataset.pipeline)
+
+    with open(args.val_pkl, 'rb') as f:
+        data = pickle.load(f)
+    infos = data['data_list'] if isinstance(data, dict) else data
+    print(f' {len(infos)} val infos loaded')
+
+    if args.tokens_file:
+        with open(args.tokens_file) as f:
+            want = set(line.strip() for line in f if line.strip())
+        infos = [i for i in infos if i.get('token') in want]
+        print(f' Restricted to {len(infos)} infos matching tokens file')
+    else:
+        infos = infos[:args.max_samples]
+
+    # Hook to capture pts_middle_encoder output (the BEV)
+    captured = {}
+
+    def hook(module, inp, out):
+        captured['bev'] = out.detach()
+
+    handle = model.pts_middle_encoder.register_forward_hook(hook)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for i, path in enumerate(files):
-        points = np.fromfile(path, dtype=np.float32).reshape(-1, point_dim)
-        points_tensor = torch.from_numpy(points).cuda()
-        points_list = [points_tensor]
-        batch = {
-            'inputs': {'points': points_list},
-            'data_samples': [Det3DDataSample()],
-        }
+    n_ok = 0
+    for i, info in enumerate(infos):
+        # data_root must be injected so LoadPointsFromFile/MultiSweeps can
+        # resolve relative paths in the info dict.
+        info_in = dict(info)
+        info_in['lidar_points'] = dict(info['lidar_points'])
+        info_in['lidar_points']['lidar_path'] = str(
+            Path(args.data_root) / info['lidar_points']['lidar_path']
+        )
+        if 'lidar_sweeps' in info_in:
+            sweeps = []
+            for sw in info_in['lidar_sweeps']:
+                sw = dict(sw)
+                sw['lidar_points'] = dict(sw['lidar_points'])
+                sw['lidar_points']['lidar_path'] = str(
+                    Path(args.data_root) / sw['lidar_points']['lidar_path']
+                )
+                sweeps.append(sw)
+            info_in['lidar_sweeps'] = sweeps
 
-        voxel_dict = model.data_preprocessor.voxelize(points_list, batch)
-        bev = compute_bev_features(model, voxel_dict)  # [1, 64, H, W]
+        try:
+            sample = pipeline(info_in)
+        except Exception as e:
+            print(f' [{i}] pipeline failed: {e} — skipping '
+                  f'(check --data-root path / sweep file availability)')
+            continue
 
-        # Strip both .bin and .pcd suffixes: foo.pcd.bin -> foo.npy
-        out_name = path.with_suffix('').stem + '.npy'
-        np.save(out_dir / out_name, bev.squeeze(0).cpu().numpy().astype(np.float32))
+        points = sample['inputs']['points']
+        pts = points.cuda() if isinstance(points, torch.Tensor) else \
+            torch.from_numpy(np.asarray(points)).cuda()
 
-        if (i + 1) % 50 == 0 or (i + 1) == len(files):
-            print(f'[calib-bev] {i + 1}/{len(files)}  bev shape={tuple(bev.shape)}')
+        ds = Det3DDataSample()
+        ds.set_metainfo({'box_type_3d': LiDARInstance3DBoxes})
+        batch = {'inputs': {'points': [pts]}, 'data_samples': [ds]}
 
-    print(f'[calib-bev] Done. Saved {len(files)} .npy files to {out_dir}')
+        with torch.no_grad():
+            pre = model.data_preprocessor(batch, training=False)
+            model.extract_feat(pre['inputs'])  # fires hook
+
+        bev = captured['bev']
+
+        if i < args.verify_n:
+            with torch.no_grad():
+                feats = model.pts_backbone(bev)
+                if model.with_pts_neck:
+                    feats = model.pts_neck(feats)
+                head_out = model.pts_bbox_head(feats)
+            try:
+                tasks = head_out[0] if isinstance(head_out, tuple) else head_out
+                maxes = [float(t['heatmap'].sigmoid().max()) for t in tasks]
+                print(f'[verify {i}] token={info.get("token", "?")[:8]} '
+                      f'n_points={pts.shape[0]}  '
+                      f'heatmap maxes: {[round(x, 3) for x in maxes]}  '
+                      f'overall={max(maxes):.3f} (healthy if >0.8)')
+            except Exception as e:
+                print(f'[verify {i}] head read failed: {e}')
+
+        token = info.get('token', f'idx{i}')
+        np.save(out_dir / f'{token}.npy',
+                bev.squeeze(0).cpu().numpy().astype(np.float32))
+        n_ok += 1
+        if (i + 1) % 50 == 0 or (i + 1) == len(infos):
+            print(f' {i + 1}/{len(infos)}  n_points={pts.shape[0]}  '
+                  f'bev_range=[{bev.min():.2f},{bev.max():.2f}]')
+
+    handle.remove()
+    print(f' Done. Saved {n_ok}/{len(infos)} BEV tensors to {out_dir}')
 
 
 if __name__ == '__main__':
