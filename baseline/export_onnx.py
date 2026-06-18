@@ -1,5 +1,6 @@
 """
-Multi-task ONNX export for the open-mmlab 10-class CenterPoint model.
+Multi-task ONNX export for the open-mmlab 10-class CenterPoint model, supporting all FP32, 
+QAT and pruned/distilled variants.
 
 Autoware's centerpoint_onnx_converter.py cannot be used here because:
   1. It overrides the encoder type to PillarFeatureNetAutoware, incompatible
@@ -214,9 +215,7 @@ def capture_pfn_input(model: nn.Module, voxel_dict: dict) -> torch.Tensor:
     def _hook(module, args) -> None:
         captured['features'] = args[0].detach()
 
-    handle = model.pts_voxel_encoder.pfn_layers[0].register_forward_pre_hook(
-        _hook
-    )
+    handle = model.pts_voxel_encoder.pfn_layers[0].register_forward_pre_hook(_hook)
     try:
         with torch.no_grad():
             model.pts_voxel_encoder(
@@ -245,13 +244,73 @@ def compute_bev_features(model: nn.Module, voxel_dict: dict) -> torch.Tensor:
     return bev
 
 
+def apply_qat_preparation(model: nn.Module, state_dict: dict) -> nn.Module:
+    import torch.ao.quantization as tq
+
+    print("Preparing Eager QAT structure before loading weights...")
+    model.train()  # Model must be in train mode for prepare_qat
+
+    # 1. Strip MMCV wrappers so PyTorch QAT Fuser recognizes the types natively
+    for module in model.modules():
+        if isinstance(module, nn.Conv2d) and not type(module) is nn.Conv2d:
+            module.__class__ = nn.Conv2d
+        elif isinstance(module, nn.ConvTranspose2d) and not type(module) is nn.ConvTranspose2d:
+            module.__class__ = nn.ConvTranspose2d
+
+    # 2. Handle Activation Quantization Detection
+    has_act_quant = any(
+        'activation_post_process' in k and 'weight_fake_quant' not in k
+        for k in state_dict.keys()
+    )
+
+    qcfg = tq.get_default_qat_qconfig('fbgemm') if has_act_quant else tq.QConfig(
+        activation=nn.Identity,
+        weight=tq.get_default_qat_qconfig('fbgemm').weight
+    )
+
+    # FIX: ONLY apply QAT to the backbone and neck!
+    model.qconfig = None
+    if hasattr(model, 'pts_backbone'):
+        model.pts_backbone.qconfig = qcfg
+    if hasattr(model, 'pts_neck'):
+        model.pts_neck.qconfig = qcfg
+
+    # 3. Detect and fuse blocks ONLY in the targeted layers
+    modules_to_fuse = []
+    for name, module in model.named_modules():
+        if not (name.startswith('pts_backbone') or name.startswith('pts_neck')):
+            continue
+
+        if isinstance(module, torch.nn.Sequential):
+            children = list(module.named_children())
+            for i in range(len(children) - 1):
+                n1, m1 = children[i]
+                n2, m2 = children[i + 1]
+
+                # STRICTLY fuse Conv2d + BatchNorm2d only.
+                if isinstance(
+                        m1, nn.Conv2d) and not isinstance(
+                        m1, nn.ConvTranspose2d) and isinstance(
+                        m2, nn.BatchNorm2d):
+                    if i + 2 < len(children) and isinstance(children[i + 2][1], nn.ReLU):
+                        modules_to_fuse.append(
+                            [f"{name}.{n1}", f"{name}.{n2}", f"{name}.{children[i+2][0]}"])
+                    else:
+                        modules_to_fuse.append([f"{name}.{n1}", f"{name}.{n2}"])
+
+    if modules_to_fuse:
+        print(f"Fusing {len(modules_to_fuse)} blocks in backbone/neck...")
+        tq.fuse_modules_qat(model, modules_to_fuse, inplace=True)
+
+    tq.prepare_qat(model, inplace=True)
+    return model
+
+
 def export_encoder(model: nn.Module, voxel_dict: dict, out_dir: str, variant: str) -> None:
     pfn_input = capture_pfn_input(model, voxel_dict)
     enc = PillarEncoderONNX(model.pts_voxel_encoder.pfn_layers).cuda().eval()
 
-    out_path = os.path.join(
-        out_dir, f'pts_voxel_encoder_centerpoint_{variant}.onnx'
-    )
+    out_path = os.path.join(out_dir, f'pts_voxel_encoder_centerpoint_{variant}.onnx')
     torch.onnx.export(
         enc,
         (pfn_input,),
@@ -262,14 +321,16 @@ def export_encoder(model: nn.Module, voxel_dict: dict, out_dir: str, variant: st
             'input_features': {0: 'num_voxels', 1: 'num_max_points'},
             'pillar_features': {0: 'num_voxels'},
         },
-        opset_version=11,
+        opset_version=13,  # Opset 13 is REQUIRED for Q/DQ nodes
     )
     print(f'Saved encoder ONNX: {out_path}')
 
 
 def export_backbone_neck_head(
-    model: nn.Module, voxel_dict: dict, out_dir: str, variant: str
-) -> None:
+        model: nn.Module,
+        voxel_dict: dict,
+        out_dir: str,
+        variant: str) -> None:
     bev = compute_bev_features(model, voxel_dict)
     bnk = BackboneNeckHeadONNX(
         model.pts_backbone, model.pts_neck, model.pts_bbox_head
@@ -279,9 +340,7 @@ def export_backbone_neck_head(
     for name in OUTPUT_NAMES:
         dyn[name] = {0: 'batch_size', 2: 'H', 3: 'W'}
 
-    out_path = os.path.join(
-        out_dir, f'pts_backbone_neck_head_centerpoint_{variant}.onnx'
-    )
+    out_path = os.path.join(out_dir, f'pts_backbone_neck_head_centerpoint_{variant}.onnx')
     torch.onnx.export(
         bnk,
         (bev,),
@@ -289,45 +348,24 @@ def export_backbone_neck_head(
         input_names=['spatial_features'],
         output_names=OUTPUT_NAMES,
         dynamic_axes=dyn,
-        opset_version=11,
+        opset_version=13,  # Opset 13 is REQUIRED for Q/DQ nodes
     )
     print(f'Saved backbone-neck-head ONNX: {out_path}')
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description='Export 10-class CenterPoint to Autoware two-ONNX format'
-    )
+        description='Export 10-class CenterPoint to Autoware two-ONNX format')
     p.add_argument('--config', required=True, help='mmdet3d config path')
+    p.add_argument('--checkpoint', help='FP32 .pth checkpoint')
+    p.add_argument('--model-path', help='Full model object (.pt)')
     p.add_argument(
-        '--checkpoint',
-        help='FP32 .pth checkpoint — architecture matches --config '
-             '(loaded via init_model). Use for the FP32 baseline.'
-    )
-    p.add_argument(
-        '--model-path',
-        help='Pruned/distilled full model object (.pt, saved via '
-             'torch.save(model, path)) — architecture differs from '
-             '--config, loaded directly via torch.load(). '
-             'Mutually exclusive with --checkpoint.'
-    )
-    p.add_argument(
-        '--variant', default='custom',
-        help='Suffix for output filenames, e.g. pruned25, '
-             'distilled25 (default: custom)'
-    )
+        '--qat-checkpoint',
+        help='QAT .pth checkpoint. Automates fusion and FakeQuantize extraction.')
+    p.add_argument('--variant', default='custom')
     p.add_argument('--out', default='baseline/results/onnx_export/')
-    p.add_argument(
-        '--synthetic-input', action='store_true',
-        help='Generate a synthetic point cloud batch for tracing '
-             'instead of loading from cfg.test_dataloader — avoids '
-             'needing /data/nuscenes/ extracted. See module docstring.'
-    )
-    p.add_argument(
-        '--num-points', type=int, default=20000,
-        help='Points per synthetic point cloud (default: 20000, '
-             'only used with --synthetic-input)'
-    )
+    p.add_argument('--synthetic-input', action='store_true')
+    p.add_argument('--num-points', type=int, default=20000)
     return p.parse_args()
 
 
@@ -335,34 +373,90 @@ def main() -> None:
     args = parse_args()
     os.makedirs(args.out, exist_ok=True)
 
-    if args.checkpoint and args.model_path:
-        raise ValueError('--checkpoint and --model-path are mutually exclusive')
+    if sum(bool(x) for x in [args.checkpoint, args.model_path, args.qat_checkpoint]) != 1:
+        raise ValueError(
+            'Exactly one of --checkpoint, --model-path, or --qat-checkpoint is required')
 
     cfg = Config.fromfile(args.config)
 
     if args.model_path:
-        print(f'Loading compressed model object from {args.model_path}...')
+        print(f'Loading full model object from {args.model_path}...')
         model = torch.load(args.model_path, map_location='cuda:0')
         model.cuda()
+        model.eval()
     elif args.checkpoint:
+        print(f'Loading FP32 checkpoint from {args.checkpoint}...')
         model = init_model(cfg, args.checkpoint, device='cuda:0')
-    else:
-        raise ValueError('One of --checkpoint or --model-path is required')
-    model.eval()
+        model.eval()
+    elif args.qat_checkpoint:
+        print(f'Loading QAT checkpoint from {args.qat_checkpoint}...')
+        model = init_model(cfg, device='cpu')
+
+        qat_ckpt = torch.load(args.qat_checkpoint, map_location='cpu')
+        state_dict = qat_ckpt.get('state_dict', qat_ckpt)
+
+        model = apply_qat_preparation(model, state_dict)
+
+        prepared_keys = set(model.state_dict().keys())
+        mapped_state_dict = {}
+        for k, v in state_dict.items():
+            if k in prepared_keys:
+                mapped_state_dict[k] = v
+            elif 'deblocks.2.1.0.' in k:
+                new_k = k.replace('deblocks.2.1.0.', 'deblocks.2.1.')
+                if new_k in prepared_keys:
+                    mapped_state_dict[new_k] = v
+                else:
+                    mapped_state_dict[k] = v
+            else:
+                mapped_state_dict[k] = v
+
+        for name, buf in model.named_buffers():
+            if name in mapped_state_dict:
+                ckpt_buf = mapped_state_dict[name]
+                if buf.shape != ckpt_buf.shape and buf.numel() == 0:
+                    buf.resize_(ckpt_buf.shape)
+
+        missing, unexpected = model.load_state_dict(mapped_state_dict, strict=False)
+        if missing:
+            print(f"Ignored missing keys (expected if not quantized): {missing[:5]}...")
+        if unexpected:
+            print(f"Ignored unexpected keys: {unexpected[:5]}...")
+
+        model.cuda()
+        model.eval()
+
+        import torch.ao.quantization as tq
+        # 1. Explicitly disable the FakeQuantize observers!
+        model.apply(tq.disable_observer)
+
+        # 2. THE MONKEY PATCH
+        # PyTorch's FusedMovingAvgObsFakeQuantize uses a C++ kernel that ONNX doesn't support.
+        # We replace its forward pass with standard fake_quantize functions, which
+        # perfectly map to ONNX Q/DQ.
+        def patched_fused_obs_fake_quant_forward(self, X):
+            if self.fake_quant_enabled[0] == 1:
+                if self.is_per_channel:
+                    return torch.fake_quantize_per_channel_affine(
+                        X, self.scale, self.zero_point.to(
+                            torch.int32), self.ch_axis, self.quant_min, self.quant_max)
+                else:
+                    return torch.fake_quantize_per_tensor_affine(
+                        X, self.scale, self.zero_point.to(
+                            torch.int32), self.quant_min, self.quant_max)
+            return X
+
+        tq.FusedMovingAvgObsFakeQuantize.forward = patched_fused_obs_fake_quant_forward
+        tq.FakeQuantize.forward = patched_fused_obs_fake_quant_forward
 
     if args.synthetic_input:
-        print('Generating synthetic point cloud batch for tracing '
-              '(no dataset required)...')
-        batch = create_synthetic_batch(
-            cfg, batch_size=1, num_points=args.num_points
-        )
+        print('Generating synthetic point cloud batch for tracing...')
+        batch = create_synthetic_batch(cfg, batch_size=1, num_points=args.num_points)
     else:
         dataloader = Runner.build_dataloader(cfg.test_dataloader)
         batch = next(iter(dataloader))
 
-    voxel_dict = model.data_preprocessor.voxelize(
-        batch['inputs']['points'], batch
-    )
+    voxel_dict = model.data_preprocessor.voxelize(batch['inputs']['points'], batch)
 
     export_encoder(model, voxel_dict, args.out, args.variant)
     export_backbone_neck_head(model, voxel_dict, args.out, args.variant)
