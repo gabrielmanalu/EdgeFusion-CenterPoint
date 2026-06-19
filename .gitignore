@@ -27,6 +27,7 @@ baseline/results/*.json
 compression/results/*
 !compression/results/pareto/
 deployment/benchmarks/results/
+deployment/output/
 
 # C++ build artefacts
 deployment/build/

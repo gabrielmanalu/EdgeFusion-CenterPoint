@@ -5,7 +5,7 @@ Post-Training Quantization (PTQ) → Sensitivity Analysis → Quantization-Aware
 → Structured Pruning Sweep → Knowledge Distillation → Pareto Assembly.
 
 The goal is to map the accuracy / size / latency trade-off space for deploying CenterPoint
-on Jetson Orin Nano (8GB, 15W), and identify which compressed variants are worth carrying
+on Jetson Orin Nano (8GB, 25W), and identify which compressed variants are worth carrying
 forward to TensorRT INT8 benchmarking on real hardware.
 
 ---
@@ -438,7 +438,7 @@ The first pruning run (ratio 25%) completed training with a healthy loss curve
 before evaluation. `state_dict()` includes both parameters AND buffers — but
 `.parameters()` does NOT include BatchNorm's `running_mean`/`running_var` (these are
 buffers). `ema_model`'s buffers were frozen at the moment of `copy.deepcopy()`, taken
-_before_ any training — especially wrong for the freshly-reinitialized `shared_conv`'s
+*before* any training — especially wrong for the freshly-reinitialized `shared_conv`'s
 BatchNorm, whose statistics never matched a randomly-initialized layer in the first place.
 
 Loading this state dict overwrote `model`'s properly-trained BN buffers (accumulated
@@ -454,7 +454,7 @@ start with no issue.
 
 **Recovery for ratio 25% (no retrain needed):** `--recalibrate` mode rebuilds the pruned
 architecture (deterministic L1 selection given the same FP32 weights + ratio), loads the
-_trained_ EMA parameters from the broken `pruned_25_epoch5.pth` (these were correct —
+*trained* EMA parameters from the broken `pruned_25_epoch5.pth` (these were correct —
 only the buffers were stale), resets all BatchNorm running stats, and runs ~200
 forward-only batches in `train()` mode with cumulative averaging (`momentum=None`) to
 recompute `running_mean`/`running_var` from scratch against the trained weights. This is
@@ -488,7 +488,7 @@ reduced backbone capacity struggles most with temporal/motion cues.
 ~1.7 hrs/epoch) rather than CBGS class-balanced sampling (7,724 steps/epoch, ~7.5
 hrs/epoch — a 4.4x cost). `--use-cbgs` is available if needed.
 
-Rationale: CBGS oversampling matters most when _learning_ rare-class representations from
+Rationale: CBGS oversampling matters most when *learning* rare-class representations from
 scratch. Here we're fine-tuning from FP32 weights that already encode 20 epochs of
 CBGS-trained knowledge — QAT validated this assumption (raw dataset, 0.4814 mAP, matching
 published FP32 numbers within noise). The pruning sweep accepts that rare-class recovery
@@ -497,7 +497,7 @@ across three ratios (vs ~112 hrs total with CBGS).
 
 ### Why pruning recovery used fine-tuning, not QAT
 
-QAT (Quantization-Aware Training) recovers _quantization_ loss by training with
+QAT (Quantization-Aware Training) recovers *quantization* loss by training with
 FakeQuantize active. Pruning loss is a different problem — physically removed channels
 mean reduced representational capacity, which FakeQuantize simulation doesn't address.
 Given QAT vs PTQ delta on the unpruned baseline was only +0.02% (statistical noise), QAT
@@ -547,7 +547,7 @@ the teacher believes an object exists, without requiring GT-based positive/negat
 
 Pruning only touches `pts_backbone`/`pts_neck`; `shared_conv` is rebuilt to the same
 64-channel output, and task heads are untouched. Teacher and student therefore produce
-_identically-shaped_ head outputs — heatmap/reg/height/dim/rot/vel — so output-level
+*identically-shaped* head outputs — heatmap/reg/height/dim/rot/vel — so output-level
 distillation needs no adapter convolution. (Feature-level distillation on the 384 vs
 288-channel neck outputs would need one; deliberately excluded from v1 as a lower-value,
 higher-risk addition.)
@@ -584,7 +584,7 @@ showed **no change**: bicycle 0.034→0.035, construction_vehicle 0.059→0.059.
 **`L_heatmap_distill` (dense sigmoid-MSE) is background-dominated.** The vast majority
 of the 512×512 heatmap is background, where both teacher and student already output
 near-0 — correctly. Rare-class foreground pixels (bicycle, construction_vehicle) are a
-tiny fraction of the total MSE sum. Increasing `alpha` scales the _whole_ loss
+tiny fraction of the total MSE sum. Increasing `alpha` scales the *whole* loss
 uniformly; it doesn't selectively amplify rare-class foreground signal. This is the
 same class-imbalance problem focal loss exists to solve for the task loss — our
 distillation loss has no equivalent. A foreground-weighted or per-class heatmap
@@ -592,12 +592,12 @@ distillation term would be needed to actually target rare classes — a magnitud
 to `alpha` alone is unlikely to help.
 
 **`L_reg_distill` (teacher-confidence-weighted L1) likely suffers spatial misalignment.**
-The weighting uses the _teacher's_ heatmap peaks — but the student's `shared_conv` was
+The weighting uses the *teacher's* heatmap peaks — but the student's `shared_conv` was
 reinitialized (random kaiming init, see "shared_conv rebuild" above), so its spatial
 confidence pattern can differ from the teacher's even after training. If
 teacher-confident locations don't align with GT-assigned locations, `L_reg_distill` and
 `L_task`'s regression terms can pull in different directions for the same spatial
-cells — plausibly explaining why mAVE/mAOE got _worse_ rather than moving toward the
+cells — plausibly explaining why mAVE/mAOE got *worse* rather than moving toward the
 teacher's (better) values. A GT-location-based regression distillation (matching teacher
 outputs at GT-assigned cells, rather than teacher-confidence-weighted cells) would avoid
 this misalignment.
@@ -608,7 +608,7 @@ At `alpha=beta=1.0` (initial attempt), `hm=0.0011` and `reg=0.030` against
 `task≈25-29` — distillation contributed <0.2% of total loss, i.e. no effect. Raised to
 `alpha=2000, beta=50`, giving `alpha*hm≈1.8` (7%) and `beta*reg≈1.25` (5%) — a
 meaningful but non-dominant auxiliary signal (~12% of total loss combined). Given the
-root causes above are about loss _formulation_ rather than _magnitude_, further
+root causes above are about loss *formulation* rather than *magnitude*, further
 alpha/beta tuning is unlikely to flip this to a clear win without also addressing
 foreground-weighting (heatmap) and spatial alignment (regression) — noted as future work
 ("distillation v2").
@@ -637,15 +637,15 @@ aggressive than Autoware's production default.
 
 Key parameter differences between Autoware's deployed model and ours:
 
-| Parameter                 | Autoware deployed           | This project         |
-| ------------------------- | --------------------------- | -------------------- |
-| `point_cloud_range` z     | −3.0 to +5.0                | −5.0 to +3.0         |
-| `voxel_size`              | [0.2, 0.2, 8.0]             | [0.2, 0.2, 8.0]      |
-| `point_feature_size`      | 4                           | 5                    |
-| `encoder_in_feature_size` | 9                           | 11                   |
-| `trt_precision`           | fp16                        | INT8 (Jetson target) |
-| Classes                   | 5                           | 10                   |
-| Training data             | nuScenes + TIER IV internal | nuScenes only        |
+| Parameter | Autoware deployed | This project |
+|---|---|---|
+| `point_cloud_range` z | −3.0 to +5.0 | −5.0 to +3.0 |
+| `voxel_size` | [0.2, 0.2, 8.0] | [0.2, 0.2, 8.0] |
+| `point_feature_size` | 4 | 5 |
+| `encoder_in_feature_size` | 9 | 11 |
+| `trt_precision` | fp16 | INT8 (Jetson target) |
+| Classes | 5 | 10 |
+| Training data | nuScenes + TIER IV internal | nuScenes only |
 
 The z-range difference reflects different sensor mounting heights between Autoware's test
 vehicle and the nuScenes vehicle. Our model is trained with the standard nuScenes range and
@@ -654,7 +654,7 @@ the values from the training config, not Autoware's defaults.
 
 ---
 
-## What comes next
+## Results summary — all phases complete
 
 ```
 Compression
@@ -664,46 +664,73 @@ Compression
 ├─ Structured pruning       complete — 25%/40%/55%, see Pruning Sweep above
 ├─ Knowledge distillation   complete — no improvement over Pruned 25%, see above
 └─ Pareto assembly          complete — architecture_pareto.png, deployment_pareto.png
+
+Deployment (Jetson Orin Nano 8GB, JetPack R36.4.0, TRT 10.3.0, 25W)
+├─ ONNX export              complete — 5 variants + QAT, synthetic-input / explicit-Q
+├─ BEV calibration data     complete — 512 × [64,512,512] .npy, multi-sweep (9 sweeps)
+├─ TRT engine build         complete — build_engine.py (entropy/minmax PTQ + QAT Q/DQ)
+├─ Latency/power benchmark  complete — benchmark.py, tegrastats VDD_CPU_GPU_CV / VDD_IN
+├─ On-device mAP/NDS        complete — 512-sample subset, standalone decode + nuscenes-devkit
+└─ Recommendation           QAT INT8 on 25W (see below)
 ```
 
-`pareto.py` assembles all 7 variants (FP32, PTQ/QAT-INT8, Pruned 25/40/55%, Distilled) into
-two charts: an architecture Pareto (params vs mAP/NDS, all measured) and a projected
-deployment Pareto (full-model size under TRT INT8, measured from exported ONNX file
-sizes × the validated near-free INT8 factor). Distilled and Pruned 25% land at
-effectively the same point (16.8% projected size, ~0.408-0.409 mAP, identical ONNX
-size: 16,083,947 bytes) — distillation didn't shift the front.
+`pareto.py` assembles all variants into two charts: an architecture Pareto
+(params vs mAP/NDS, all measured) and a deployment Pareto using **real TRT INT8
+engine sizes** measured on Jetson (not ONNX-size projections). Distilled and
+Pruned 25% land at the same point (4.90/4.92 MB engines, identical ONNX size).
 
 ![Architecture Pareto](results/pareto/architecture_pareto.png)
 
-![Projected Deployment Pareto](results/pareto/deployment_pareto.png)
+![Deployment Pareto — Real TRT INT8 Engine Sizes](results/pareto/deployment_pareto.png)
 
-**ONNX export complete** for all 5 variants (`compression/results/onnx_export/`),
-using `--synthetic-input` mode (no `/data/nuscenes/` extraction needed — random points
-within `point_cloud_range` are sufficient for tracing). Measured backbone+neck+head
-ONNX sizes:
+**ONNX export** — all 5 variants (`compression/results/onnx_export/`), via
+`--synthetic-input` (no `/data/nuscenes/` needed for tracing). Measured
+backbone+neck+head ONNX sizes:
 
-| Variant                    | ONNX size (bytes) | % of FP32 | params_pct (backbone+neck) |
-| -------------------------- | ----------------- | --------- | -------------------------- |
-| FP32 baseline              | 23,950,609        | 100.0%    | 100.0%                     |
-| Pruned 25% / Distilled 25% | 16,083,947        | 67.2%     | 56.4%                      |
-| Pruned 40%                 | 12,329,623        | 51.5%     | 36.0%                      |
-| Pruned 55%                 | 9,472,899         | 39.6%     | 20.3%                      |
+| Variant | ONNX size | % of FP32 | TRT INT8 engine | params% |
+|---|---|---|---|---|
+| FP32 baseline | 23,950,609 B | 100.0% | 6.82 MB | 100.0% |
+| Pruned 25% / Distilled 25% | 16,083,947 B | 67.2% | 4.90 / 4.92 MB | 56.4% |
+| Pruned 40% | 12,329,623 B | 51.5% | 4.35 MB | 36.0% |
+| Pruned 55% | 9,472,899 B | 39.6% | 3.44 MB | 20.3% |
+| QAT (explicit Q/DQ) | — | — | 13.29 MB | 100.0% |
 
-Full-model % > backbone+neck params_pct in every case — `task_heads` (~1.1-1.5M
-params, fixed) become a larger fraction of the total as backbone+neck shrinks.
-Projected deployment sizes (full-model % × 0.25 INT8 factor) used in the deployment
-Pareto chart above:
+TRT engine compression ratio is not a flat 4× — fixed-overhead metadata,
+calibration tables, and kernel binaries add ~1–2 MB regardless of model size. The QAT
+engine is larger (13.29 MB) because explicit-quantization engines carry Q/DQ scale
+tensors and keep more of the graph unfused (see latency note below).
 
-| Variant                    | Projected size | mAP             | Status                         |
-| -------------------------- | -------------- | --------------- | ------------------------------ |
-| QAT INT8 (full arch)       | 25.0%          | 0.4814          | measured (A40 FakeQuantize)    |
-| Pruned 25% / Distilled 25% | 16.8%          | 0.4081 / 0.4094 | projected — validate on Jetson |
-| Pruned 40%                 | 12.9%          | 0.2838          | projected — validate on Jetson |
-| Pruned 55%                 | 9.9%           | 0.2149          | projected — validate on Jetson |
+**Jetson benchmark + on-device accuracy (25W, jetson_clocks, 200 iters, 512-sample mAP):**
 
-**Next phase — Jetson deployment.** Build TRT INT8 engines from the exported ONNX
-files using `jetson_calib` (512 samples), then benchmark mAP/latency/power on Jetson
-Orin Nano. The two practical candidates are FP32-baseline→TRT-INT8 and
-Pruned25→TRT-INT8 (see root README Pareto Candidates section); Pruned 40/55% and
-Distilled 25% ONNX are exported for Pareto completeness but unlikely to be the final
-recommendation given their accuracy levels.
+| Variant | quant | engine | p50 | FPS | VDD_IN | mJ/frame | on-device mAP | A40 mAP (ref) |
+|---|---|---|---|---|---|---|---|---|
+| **QAT INT8** (deployed) | QAT+Q/DQ | 13.29 MB | 25.70ms | 38.9 | 19.87W | 257.8 | **0.4265** | 0.4814 |
+| FP32 → TRT INT8 | PTQ minmax | 6.82 MB | 8.09ms | 123.5 | 16.60W | 63.5 | 0.3612 | 0.4815 |
+| Pruned 25% | PTQ minmax | 4.90 MB | 7.46ms | 134.1 | 16.41W | 57.9 | 0.2637 | 0.4081 |
+| Pruned 40% | PTQ minmax | 4.35 MB | 8.17ms | 122.3 | 15.81W | 60.0 | 0.1176 | 0.2838 |
+| Pruned 55% | PTQ minmax | 3.44 MB | 6.93ms | 144.3 | 15.61W | 49.3 | 0.1556 | 0.2149 |
+| Distilled 25% | PTQ minmax | 4.92 MB | 7.46ms | 134.1 | 16.38W | 57.7 | 0.2599 | 0.4094 |
+
+*Two accuracy columns: `on-device mAP` is the deployed TRT engine on a 512-sample
+subset with the standalone numpy decode; `A40 mAP (ref)` is the cloud PyTorch
+full-val (6019-sample) accuracy. They differ by design — see the 512-vs-6019 and
+PTQ-vs-QAT decomposition in `docs/design_decisions.md`. The pruned/distilled rows use
+PTQ on plain fine-tuned weights (none were QAT-trained), so their on-device mAP
+understates true capability; the A40 column is the fair variant-to-variant comparison.*
+
+**Recommendation: QAT INT8 on the 25W power mode** (on-device mAP 0.4265, 25.70ms,
+19.87W VDD_IN). Reasoning, in two parts:
+
+1. *Pruning is the wrong axis.* It changes latency by under ~1ms while costing large
+   accuracy, because tensor-core alignment (non-standard channel counts padded to
+   multiples of 16 by TRT) and memory-bandwidth-bound 512×512 BEV execution dominate
+   latency, not parameter count. Pareto-dominated by quantizing the full architecture.
+2. *Of the INT8 production methods, only QAT recovers FP32-level accuracy on TensorRT.*
+   PTQ calibration of plain weights leaves a real gap (entropy 0.30 → minmax 0.3612 vs
+   the 0.432 FP32 ceiling); QAT-trained weights + explicit Q/DQ reach 0.4265. The cost
+   is a 3× latency penalty (25.70ms vs 8.09ms) because explicit Q/DQ nodes block TRT's
+   Conv+BN+ReLU fusion — acceptable since 25.70ms still clears the 10–20Hz LiDAR
+   real-time budget and 19.87W fits the 25W envelope. Making QAT *also* fast (NVIDIA
+   `pytorch-quantization` toolkit for fusion-aware Q/DQ) is documented future work.
+
+See `docs/design_decisions.md` → "On-device mAP validation" for the full analysis.

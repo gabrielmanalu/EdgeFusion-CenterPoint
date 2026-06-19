@@ -7,23 +7,38 @@
 ---
 
 INT8-compressed CenterPoint LiDAR 3D detector for real-time autonomous driving inference
-on Jetson Orin Nano 8GB (15W).
+on Jetson Orin Nano 8GB (25W power mode).
 
 Covers the full pipeline from FP32 baseline evaluation through INT8 quantization,
 structured pruning, knowledge distillation, TensorRT deployment, and Autoware integration.
-Target: `autoware_perception_msgs::DetectedObjects` from a 15W edge device.
+Target: `autoware_perception_msgs::DetectedObjects` from a 25W edge device.
 
 ---
 
 ## Why this project
 
 Modern production autonomous driving stacks run 3D LiDAR detection on data center GPUs.
-Deploying the same quality perception on a 15W edge device requires careful compression
+Deploying the same quality perception on an embedded edge device requires careful compression
 without destroying detection reliability.
 
 This project answers: how much of a state-of-the-art LiDAR detector can be preserved
 at INT8 precision and reduced channel count on Jetson Orin Nano, and what does the
 accuracy / latency / power trade-off look like across the full Pareto front?
+
+**Finding**: INT8 quantization of the full FP32 architecture is the correct compression
+strategy for Jetson Orin Nano — accuracy is recovered to near-FP32 levels through
+quantization-aware training (QAT), while structured pruning (L1-magnitude, 25–55%) does
+*not* translate to proportional inference speedup on this hardware (tensor-core alignment
+constraints + memory-bandwidth-bound execution), making its accuracy cost Pareto-dominated
+by INT8 of the full architecture. A second, deployment-specific finding emerged on-device:
+**how** INT8 is produced matters as much as the precision itself. Post-training calibration
+of plain FP32 weights (TensorRT's entropy or minmax calibrators) leaves a real accuracy gap
+versus FP32, while QAT-trained weights exported with explicit quantize/dequantize nodes
+recover it — at the cost of a TensorRT layer-fusion penalty that makes the QAT engine
+slower (25.7ms vs 8.1ms) and pushes power into the 25W envelope. The recommended deployable
+configuration is therefore **QAT INT8 on the 25W power mode**, which comfortably meets
+the 10–20Hz real-time LiDAR budget. See [`docs/design_decisions.md`](docs/design_decisions.md)
+→ "On-device mAP validation" for the full investigation.
 
 ---
 
@@ -48,8 +63,8 @@ accuracy / latency / power trade-off look like across the full Pareto front?
 │  Compression stack (cloud A40)                                      │
 │  PTQ INT8 → Sensitivity → QAT → Pruning sweep → Distillation        │
 ├─────────────────────────────────────────────────────────────────────┤
-│  Deployment (Jetson Orin Nano 8GB / 15W)                            │
-│  ONNX → TRT INT8 engine → ROS2 node → Autoware                      │
+│  Deployment (Jetson Orin Nano 8GB / 25W)                            │
+│  QAT → ONNX (explicit Q/DQ) → TRT INT8 engine → ROS2 → Autoware     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -59,15 +74,15 @@ accuracy / latency / power trade-off look like across the full Pareto front?
 
 ### Compression Sweep
 
-| Variant              | mAP    | NDS    | Params | Δ mAP  |
-| -------------------- | ------ | ------ | ------ | ------ |
-| FP32 baseline        | 0.4815 | 0.5922 | 100%   | —      |
-| PTQ INT8             | 0.4812 | 0.5903 | 100%   | −0.03% |
-| QAT INT8             | 0.4814 | 0.5910 | 100%   | −0.01% |
-| Pruned 25%           | 0.4081 | 0.5382 | 56.4%  | −15.2% |
-| Pruned 40%           | 0.2838 | 0.3902 | 36.0%  | −41.0% |
-| Pruned 55%           | 0.2149 | 0.3136 | 20.3%  | −55.4% |
-| Distilled (25% arch) | 0.4094 | 0.5344 | 56.4%  | −15.0% |
+| Variant | mAP | NDS | Params | Δ mAP |
+| --- | --- | --- | --- | --- |
+| FP32 baseline | 0.4815 | 0.5922 | 100% | — |
+| PTQ INT8 | 0.4812 | 0.5903 | 100% | −0.03% |
+| QAT INT8 | 0.4814 | 0.5910 | 100% | −0.01% |
+| Pruned 25% | 0.4081 | 0.5382 | 56.4% | −15.2% |
+| Pruned 40% | 0.2838 | 0.3902 | 36.0% | −41.0% |
+| Pruned 55% | 0.2149 | 0.3136 | 20.3% | −55.4% |
+| Distilled (25% arch) | 0.4094 | 0.5344 | 56.4% | −15.0% |
 
 INT8 quantization is essentially free on this architecture (BatchNorm normalizes
 activations before every conv, producing INT8-friendly distributions). One-shot
@@ -111,36 +126,113 @@ Distillation's per-class deltas vs Pruned 25% are mostly noise-level (trailer +0
 truck +0.010, motorcycle −0.007). The two classes `L_heatmap_distill` specifically
 targeted — bicycle and construction_vehicle — show **no change**.
 
-### Pareto Candidates (Jetson deployment — pending)
+### Jetson Deployment Results (Orin Nano 8GB, 25W, TRT 10.3.0)
 
-Two views are assembled by `compression/pareto.py`: an **architecture Pareto**
-(measured params vs mAP/NDS) and a **projected deployment Pareto** (size under TRT
-INT8, assuming the validated near-free INT8 factor — 0.25× — extends to pruned
-architectures, pending Jetson validation).
+All variants benchmarked on Jetson Orin Nano Super (JetPack R36.4.0, TRT 10.3.0)
+with `jetson_clocks` locked, on the **25W** power mode. Power via tegrastats
+VDD_CPU_GPU_CV (CPU+GPU+CV rail, inference-relevant) and VDD_IN (total module).
+Latency is the backbone+neck+head engine (FP32 encoder engine adds negligible
+time). On-device mAP/NDS are measured on a **512-sample** subset of the nuScenes
+val set (see "On-device accuracy" note below).
 
-| Variant                    | mAP             | Projected size (TRT INT8) | Status                      | Latency | Power |
-| -------------------------- | --------------- | ------------------------- | --------------------------- | ------- | ----- |
-| QAT INT8 (full arch)       | 0.4814          | 25.0%                     | measured (A40 FakeQuantize) | TBD     | TBD   |
-| Pruned 25% / Distilled 25% | 0.4081 / 0.4094 | 14.1%                     | projected                   | TBD     | TBD   |
-| Pruned 40%                 | 0.2838          | 9.0%                      | projected                   | TBD     | TBD   |
-| Pruned 55%                 | 0.2149          | 5.1%                      | projected                   | TBD     | TBD   |
+| Variant | Quant method | Engine | p50 latency | FPS | VDD_IN | mJ/frame | on-device mAP | on-device NDS | A40 mAP (ref) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **QAT INT8** (recommended) | QAT + explicit Q/DQ | 13.29 MB | 25.70ms | 38.9 | 19.87W | 257.8 | **0.4265** | **0.4804** | 0.4814 |
+| FP32 → TRT INT8 | PTQ (minmax) | 6.82 MB | 8.09ms | 123.5 | 16.60W | 63.5 | 0.3612 | 0.4304 | 0.4815 |
+| Pruned 25% → TRT INT8 | PTQ (minmax) | 4.90 MB | 7.46ms | 134.1 | 16.41W | 57.9 | 0.2637 | 0.3714 | 0.4081 |
+| Pruned 40% → TRT INT8 | PTQ (minmax) | 4.35 MB | 8.17ms | 122.3 | 15.81W | 60.0 | 0.1176 | 0.1930 | 0.2838 |
+| Pruned 55% → TRT INT8 | PTQ (minmax) | 3.44 MB | 6.93ms | 144.3 | 15.61W | 49.3 | 0.1556 | 0.2267 | 0.2149 |
+| Distilled 25% → TRT INT8 | PTQ (minmax) | 4.92 MB | 7.46ms | 134.1 | 16.38W | 57.7 | 0.2599 | 0.3579 | 0.4094 |
 
-ONNX export complete for all 5 variants (`compression/results/onnx_export/`). Projected
-sizes use the _full backbone+neck+head_ ONNX size (23.95MB FP32 baseline → 16.08/12.33/
-9.47MB for Pruned 25/40/55%, i.e. 67.2%/51.5%/39.6% of FP32), not the backbone+neck-only
-params ratio (56.4%/36.0%/20.3%) — `task_heads` (~1.1-1.5M params) are untouched by
-pruning, so they become a larger fraction of the total as backbone+neck shrinks. The
-gap to QAT-INT8 (25%) is narrower than the channel-ratio alone would suggest.
+**Recommended deployment: QAT INT8 (0.4265 mAP / 0.4804 NDS on-device, 25.70ms,
+19.87W VDD_IN on the 25W mode).** At 25.70ms it runs comfortably within the
+10–20Hz real-time LiDAR budget (50–100ms per frame), with the full frame budget
+left for voxelization, decode, and ROS2 messaging. This is the only configuration
+that recovers near-FP32 accuracy on-device.
 
-Pruned 25% and Distilled land at effectively the same point (16.8% size, ~0.408-0.409
-mAP, exact same ONNX size: 16,083,947 bytes both) — distillation didn't shift the
-Pareto front (see Compression Sweep note above).
+#### Real-time target: latency vs LiDAR rate, not raw FPS
 
-INT8 quantization shown near-free for the unpruned architecture (PTQ 0.4812 / QAT
-0.4814 vs FP32 0.4815). Pruned architectures retain BatchNorm after every conv (the
-property responsible for this), so the same factor is _projected_ for pruned variants —
-this is exactly what TRT INT8 benchmarking on Jetson Orin Nano validates next. TRT
-calibration uses the 512-sample `jetson_calib` set.
+nuScenes LiDAR (Velodyne HDL-32E) runs at **20Hz**; most automotive LiDAR is
+10–20Hz, and Autoware's standard perception target is **10Hz** (100ms/frame). The
+deployment-relevant question is not "how many FPS" but "does inference complete
+within one LiDAR frame period." Every variant — including the 25.70ms QAT engine —
+clears the 10Hz budget with margin, and all but QAT also clear 20Hz. The FPS
+column is a throughput metric useful for *comparing variants*, not the deployment
+constraint.
+
+#### On-device accuracy: 512-sample subset vs A40 full-val (6019)
+
+The `A40 mAP (ref)` column is the cloud PyTorch accuracy on the **full 6019-sample**
+nuScenes val set (from the compression sweep). The on-device columns are measured
+on a **512-sample** subset (the `jetson_calib` tokens, originally sized for INT8
+calibration). The two are not directly comparable, for reasons isolated by a
+controlled experiment (same 512 samples, same decode, only the execution backend
+changed):
+
+```
+A40 PyTorch, full val (6019):                       mAP 0.4815
+ONNX FP32, zero quantization, 512 subset:           mAP 0.432    ← ~10% rel drop
+TRT INT8 (minmax, plain FP32 weights), 512 subset:  mAP 0.3612
+TRT INT8 (QAT + explicit Q/DQ), 512 subset:         mAP 0.4265   ← recovers the gap
+```
+
+The 0.4815 → 0.432 step (~10% relative) is the *expected* cost of (a) evaluating on
+512 rather than 6019 samples — nuScenes mAP averages 10 classes equally, and rare
+classes (bus, construction_vehicle, motorcycle) have few instances in the subset,
+making their per-class AP noisy — and (b) the project's standalone numpy decode being
+a faithful but not byte-identical reimplementation of mmdet3d's tuned postprocessing.
+This 0.432 is the realistic FP32 *ceiling* for the on-device pipeline; QAT INT8's
+0.4265 sits essentially at that ceiling (−1.3% relative), confirming INT8 is near-free
+**when deployed correctly**. Full methodology, including the multi-day BEV
+calibration-data debugging saga that preceded these numbers, is in
+[`docs/design_decisions.md`](docs/design_decisions.md).
+
+#### Why QAT INT8 is slower than PTQ INT8 (and needs 25W)
+
+The QAT engine is 3× slower than PTQ INT8 (25.70ms vs 8.09ms) despite the same
+architecture. QAT (via `torch.ao.quantization`) exports ONNX with explicit
+`QuantizeLinear`/`DequantizeLinear` (Q/DQ) nodes, which TensorRT runs through its
+*explicit-quantization* path. That path honors the Q/DQ graph but **blocks the
+Conv+BN+ReLU layer fusion** that PTQ INT8 relies on — each layer becomes a separate
+kernel launch with dtype conversions, hence the latency and the higher power
+(19.87W VDD_IN, within the 25W envelope but above 15W). The accuracy benefit of QAT
+is real; making it *also* fast would require NVIDIA's `pytorch-quantization` toolkit
+(TRT-fusion-aware Q/DQ placement) instead of `torch.ao.quantization` — documented as
+future work.
+
+#### Why pruning does not help latency
+
+Structured pruning does not translate to proportional inference speedup on Jetson
+Orin Nano. Removing 43.6% of backbone+neck parameters (Pruned 25%) changes latency by
+only ~0.6ms vs FP32 INT8, and Pruned 40% is actually *slower*, because:
+
+1. **Tensor core alignment**: L1 magnitude pruning produces non-standard channel
+   counts (75%, 60%, 45% of original power-of-2 layers). TRT pads these internally
+   to the nearest multiple of 16 for tensor core dispatch, reducing the effective
+   FLOP savings below what parameter counts suggest. Pruned 40% is empirically
+   *slower* than the FP32 INT8 engine — a direct consequence of particularly
+   unfavourable channel alignment at 60% of original.
+2. **Memory bandwidth bound**: the 512×512 BEV spatial dimensions dominate memory
+   access time and don't change with pruning. Channel reduction only partially
+   offsets this.
+3. **Fixed task head overhead**: all 6 task heads are unpruned — they contribute
+   a constant latency floor regardless of backbone size.
+
+The accuracy cost of pruning is an order of magnitude larger than any speedup,
+making pruning Pareto-dominated by INT8 quantization of the full architecture. The
+on-device pruned/distilled mAP numbers above are lower than their A40 references
+largely *because they use PTQ on plain fine-tuned weights* (the same ~17% relative
+gap measured for fp32 PTQ); none of the pruned/distilled variants were QAT-trained,
+so their on-device numbers understate their true capability. The fair
+variant-to-variant accuracy comparison is the A40 reference column.
+
+In short: the A40 PTQ/QAT experiments established that this architecture *can* be
+quantized near-free; the on-device work established that realizing that on TensorRT
+requires QAT-trained weights with explicit quantization (PTQ calibration of plain
+weights leaves a measurable gap, only partially closed by switching TRT's entropy
+calibrator to minmax). See [`docs/design_decisions.md`](docs/design_decisions.md) →
+"On-device mAP validation" for the full progression (entropy → minmax → QAT) and
+the multi-day BEV calibration-data debugging saga that preceded it.
 
 ---
 
@@ -159,10 +251,22 @@ EdgeFusion-CenterPoint/
 │   ├── pruning.py
 │   ├── distillation.py
 │   ├── pareto.py
+│   ├── generate_calib_bev.py  ← multi-sweep BEV calibration tensor generator
 │   ├── check_fakequant.py
 │   ├── results/            ← checkpoints not in repo, see Checkpoints below
-│   │   └── pareto/
+│   │   └── pareto/         ← charts + summary ARE in repo (embedded in README)
 │   └── README.md
+├── deployment/            ← TensorRT engine build, benchmark, on-device eval
+│   ├── docker/
+│   │   ├── Dockerfile        ← l4t-jetpack:r36.4.0, TRT 10.3.0
+│   │   └── docker-compose.yml← build-engines / benchmark / infer / eval / dev
+│   ├── scripts/
+│   │   ├── build_engine.py   ← ONNX → TRT (PTQ entropy/minmax, QAT Q/DQ, FP16)
+│   │   ├── benchmark.py      ← CUDA-event latency + tegrastats power
+│   │   ├── eval.py           ← engine → decode → submission JSON (in-container)
+│   │   ├── eval_metrics.py   ← submission JSON → mAP/NDS via nuscenes-devkit (host)
+│   │   └── eval_all.sh       ← batch all variants
+│   └── README.md             ← deployment journey, findings, and all commands
 ├── docs/
 │   └── design_decisions.md
 ├── scripts/
@@ -265,20 +369,20 @@ python EdgeFusion-CenterPoint/compression/distillation.py \
 
 Model weights are not stored in this repository.
 
-**Download from Google Drive:** _(link to be added)_
+**Download from Google Drive:** *(link to be added)*
 
-| File                                                  | Description                                         | Size    |
-| ----------------------------------------------------- | --------------------------------------------------- | ------- |
-| `centerpoint_02pillar_...pth`                         | FP32 baseline (open-mmlab)                          | 24 MB   |
-| `ptq_calibrated.pth`                                  | PTQ INT8 calibrated checkpoint                      | 24 MB   |
-| `qat_best.pth`                                        | QAT INT8 fine-tuned checkpoint                      | 24 MB   |
-| `sensitivity.json`                                    | Per-layer sensitivity results                       | 3 KB    |
-| `pruned_25_recalib.pth`, `pruned_model_25_recalib.pt` | Pruned 25% (recalibrated)                           | ~14 MB  |
-| `pruned_40.pth`, `pruned_model_40.pt`                 | Pruned 40%                                          | ~9 MB   |
-| `pruned_55.pth`, `pruned_model_55.pt`                 | Pruned 55%                                          | ~5 MB   |
-| `distilled_25.pth`, `distilled_model_25.pt`           | Distilled (25% arch)                                | ~14 MB  |
-| `onnx_multitask/`                                     | Exported ONNX files (encoder + backbone-neck-head)  | 40 MB   |
-| `jetson_calib/`                                       | 512 point clouds for TRT INT8 calibration on Jetson | ~200 MB |
+| File | Description | Size |
+| --- | --- | --- |
+| `centerpoint_02pillar_...pth` | FP32 baseline (open-mmlab) | 24 MB |
+| `ptq_calibrated.pth` | PTQ INT8 calibrated checkpoint | 24 MB |
+| `qat_best.pth` | QAT INT8 fine-tuned checkpoint | 24 MB |
+| `sensitivity.json` | Per-layer sensitivity results | 3 KB |
+| `pruned_25_recalib.pth`, `pruned_model_25_recalib.pt` | Pruned 25% (recalibrated) | ~14 MB |
+| `pruned_40.pth`, `pruned_model_40.pt` | Pruned 40% | ~9 MB |
+| `pruned_55.pth`, `pruned_model_55.pt` | Pruned 55% | ~5 MB |
+| `distilled_25.pth`, `distilled_model_25.pt` | Distilled (25% arch) | ~14 MB |
+| `onnx_multitask/` | Exported ONNX files (encoder + backbone-neck-head) | 40 MB |
+| `jetson_calib/` | 512 point clouds for TRT INT8 calibration on Jetson | ~200 MB |
 
 The FP32 baseline checkpoint is also available from the
 [open-mmlab model zoo](https://github.com/open-mmlab/mmdetection3d/tree/main/configs/centerpoint).
@@ -298,6 +402,8 @@ cp distilled_*25*.p* EdgeFusion-CenterPoint/compression/results/distillation/rat
 ```
 
 ---
+
+
 
 | Document                                               | Description                                                                      |
 | ------------------------------------------------------ | -------------------------------------------------------------------------------- |
@@ -370,7 +476,7 @@ fine-tuning alone — a directly comparable A/B result.
 | ---------------------- | ------------------------------------------------ |
 | Training / compression | RunPod A40 (48GB VRAM, CUDA 12.8)                |
 | Deployment target      | Jetson Orin Nano 8GB (1024-core Ampere, 67 TOPS) |
-| TDP target             | 15W                                              |
+| TDP target             | 25W power mode (see deployment note)             |
 
 ---
 
