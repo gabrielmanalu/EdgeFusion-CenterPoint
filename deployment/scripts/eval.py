@@ -139,6 +139,29 @@ class Engine:
 
 # ── CenterPoint decode ───────────────────────────────────────────────────────
 
+def _heatmap_peak_mask(hm: np.ndarray, kernel: int = 3) -> np.ndarray:
+    """Zero out non-local-maximum heatmap cells (3×3 max-pool NMS).
+
+    For each class channel, keep a cell's score only if it equals the maximum
+    in its kernel×kernel neighborhood; otherwise set it to 0. This is the
+    standard CenterPoint peak-extraction step — it collapses each object's
+    heatmap blob to a single peak cell, preventing dozens of duplicate boxes
+    per object. Implemented with a sliding-window max via numpy stride tricks
+    (no scipy dependency).
+
+    hm: [C, H, W] post-sigmoid heatmap. Returns same shape, non-peaks zeroed.
+    """
+    c, h, w = hm.shape
+    pad = kernel // 2
+    padded = np.pad(hm, ((0, 0), (pad, pad), (pad, pad)), mode='constant')
+    maxpool = np.zeros_like(hm)
+    for dy in range(kernel):
+        for dx in range(kernel):
+            maxpool = np.maximum(maxpool, padded[:, dy:dy + h, dx:dx + w])
+    # Keep cells that equal the neighborhood max (the local peaks)
+    return np.where(hm == maxpool, hm, 0.0)
+
+
 def _circle_nms(boxes_xy: np.ndarray, scores: np.ndarray,
                 radius: float) -> np.ndarray:
     """Greedy circle NMS. boxes_xy: [N,2], scores: [N]. Returns kept indices."""
@@ -187,6 +210,15 @@ def decode_outputs(
     rot = rot[0]
     vel = vel[0]
 
+    # CenterPoint peak extraction: keep only local-maximum cells per class.
+    # Without this, every pixel in an object's heatmap blob becomes a box
+    # (a single car → dozens of detections), flooding the output with false
+    # positives and destroying precision (and therefore mAP). A 3×3 max-pool
+    # NMS keeps a cell only if it equals the max in its 3×3 neighborhood —
+    # the standard CenterPoint approach (equivalent to mmdet3d's _nms_heatmap
+    # / local_maximum with kernel=3).
+    hm = _heatmap_peak_mask(hm, kernel=3)
+
     H, W = hm.shape[1], hm.shape[2]
     xs = np.arange(W, dtype=np.float32)
     ys = np.arange(H, dtype=np.float32)
@@ -214,9 +246,13 @@ def decode_outputs(
             cx = (grid_x + reg_t[0])[mask] * stride * VOXEL_SIZE[0] + PC_RANGE[0]
             cy = (grid_y + reg_t[1])[mask] * stride * VOXEL_SIZE[1] + PC_RANGE[1]
             cz = h_t[mask]
-            dl = np.exp(np.clip(dim_t[0][mask], -5, 5))
-            dw = np.exp(np.clip(dim_t[1][mask], -5, 5))
-            dh = np.exp(np.clip(dim_t[2][mask], -5, 5))
+            # mmdet3d dim regression outputs log(dx, dy, dz) in LiDAR frame,
+            # i.e. (length, width, height). nuScenes 'size' field convention
+            # is [width, length, height] — so we swap dx<->dy below when
+            # emitting. Naming here matches the LiDAR-frame axes.
+            d_len = np.exp(np.clip(dim_t[0][mask], -5, 5))   # along-x (length)
+            d_wid = np.exp(np.clip(dim_t[1][mask], -5, 5))   # along-y (width)
+            d_hgt = np.exp(np.clip(dim_t[2][mask], -5, 5))   # along-z (height)
             yaw = np.arctan2(rot_t[0][mask], rot_t[1][mask])
             vx = vel_t[0][mask]
             vy = vel_t[1][mask]
@@ -226,7 +262,7 @@ def decode_outputs(
                 topk = np.argpartition(scores, -max_preds)[-max_preds:]
                 scores = scores[topk]
                 cx, cy, cz = cx[topk], cy[topk], cz[topk]
-                dl, dw, dh = dl[topk], dw[topk], dh[topk]
+                d_len, d_wid, d_hgt = d_len[topk], d_wid[topk], d_hgt[topk]
                 yaw, vx, vy = yaw[topk], vx[topk], vy[topk]
 
             keep = _circle_nms(
@@ -236,9 +272,12 @@ def decode_outputs(
 
             for i in keep:
                 q = Quaternion(axis=[0, 0, 1], angle=float(yaw[i]))
+                # mmdet3d CenterPoint already regresses gravity-center z
+                # (verified against nuScenes GT z), so cz is used directly.
                 detections.append({
                     'translation': [float(cx[i]), float(cy[i]), float(cz[i])],
-                    'size': [float(dl[i]), float(dw[i]), float(dh[i])],
+                    # nuScenes size = [width, length, height]
+                    'size': [float(d_wid[i]), float(d_len[i]), float(d_hgt[i])],
                     'rotation': [q.w, q.x, q.y, q.z],
                     'velocity': [float(vx[i]), float(vy[i])],
                     'detection_name': cls_name,
@@ -360,6 +399,12 @@ def parse_args() -> argparse.Namespace:
              '512 BEV → 128 head output → stride=4.'
     )
     p.add_argument('--score-thresh', type=float, default=SCORE_THRESH)
+    p.add_argument(
+        '--no-eval', action='store_true',
+        help='Skip in-container NuScenes eval (memory-heavy, OOM-prone on '
+             'Jetson). Just produce the submission JSON; compute mAP/NDS on '
+             'the host via eval_metrics.py instead.'
+    )
     p.add_argument('--out', default='/workspace/output/eval.json')
     return p.parse_args()
 
@@ -378,26 +423,24 @@ def main() -> None:
 
     results = {}
     missing_tokens = 0
-
+    
     for i, bev_path in enumerate(bev_files):
-        # Map .npy filename back to original .pcd.bin filename for token lookup
-        # e.g. n008-...__LIDAR_TOP__1234.npy → n008-...__LIDAR_TOP__1234.pcd.bin
-        pcd_name = bev_path.stem + '.pcd.bin'
-        token = token_map.get(pcd_name)
-        if token is None:
-            missing_tokens += 1
-            continue
+        # The filename is now the token itself
+        token = bev_path.stem 
+        
+        # We no longer need to look up the token via pcd_name
+        # token = token_map.get(pcd_name) 
 
         bev = np.load(bev_path).astype(np.float32)
         if bev.ndim == 3:
-            bev = bev[np.newaxis]  # add batch dim
+            bev = bev[np.newaxis]
 
         outputs = engine.infer(bev)
         dets = decode_outputs(
             outputs, stride=args.stride, score_thresh=args.score_thresh
         )
 
-        # Add sample_token to each box (required by nuscenes-devkit)
+        # Add sample_token to each box
         for d in dets:
             d['sample_token'] = token
         results[token] = dets
@@ -423,6 +466,25 @@ def main() -> None:
     with open(result_path, 'w') as f:
         json.dump(submission, f)
     print(f'[eval] Submission saved: {result_path} ({len(results)} samples)')
+
+    if args.no_eval:
+        print('[eval] --no-eval set: skipping in-container NuScenes eval. '
+              'Run eval_metrics.py on the host to compute mAP/NDS.')
+        return
+
+    # Explicitly free TRT engine + CUDA buffers before NuScenes loading.
+    # Jetson Orin Nano has 8 GB unified memory shared between CPU and GPU.
+    # The TRT engine context + input/output CUDA allocations (~70-500 MB) stay
+    # alive until garbage collected, competing with NuScenes JSON loading
+    # (~500 MB-1 GB) and causing OOM. Free them explicitly now — inference is
+    # complete and we don't need the engine any further.
+    for info in list(engine.inputs.values()) + list(engine.outputs.values()):
+        info['buf'].free()
+    del engine.context, engine.engine
+    del engine
+    import gc
+    gc.collect()
+    print('[eval] GPU memory freed — loading NuScenes...')
 
     # NuScenes evaluation
     try:
