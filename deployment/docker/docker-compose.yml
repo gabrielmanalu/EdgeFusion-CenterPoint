@@ -84,6 +84,31 @@ services:
   # Requires nuScenes annotation JSONs (v1.0-trainval/, ~400 MB metadata only)
   # mounted at NUSCENES_VAL. No sensor data (images/lidar) needed for eval.
   # Also needs nuscenes_infos_val.pkl at VAL_PKL (default: repo root).
+  # ── Inference only: produce submission JSON, no in-container eval ─────────
+  # Lightweight — no NuScenes mount, no NuScenes load (which OOMs Jetson).
+  # This is the Docker phase; compute mAP/NDS afterward on host via
+  # eval_metrics.py. Used by eval_all.sh.
+  infer:
+    <<: *base
+    volumes:
+      - ../../compression/results/onnx_export:/workspace/onnx:ro
+      - ../../jetson_calib_bev:/workspace/calib_bev:ro
+      - ../scripts:/workspace/scripts:ro
+      - ../output:/workspace/output
+      - ${VAL_PKL:-../../nuscenes_infos_val.pkl}:/workspace/nuscenes_infos_val.pkl:ro
+    command: >
+      python3 scripts/eval.py
+      --engine /workspace/output/engines/${VARIANT:-fp32}/pts_backbone_neck_head.engine
+      --calib-bev /workspace/calib_bev
+      --val-pkl /workspace/nuscenes_infos_val.pkl
+      --nuscenes /workspace/nuscenes
+      --no-eval
+      --out /workspace/output/eval_${VARIANT:-fp32}.json
+
+  # ── Full eval (inference + in-container NuScenes eval) ────────────────────
+  # WARNING: the NuScenes eval step OOMs on Jetson Orin Nano (8 GB). Prefer
+  # the `infer` service + host-side eval_metrics.py. Kept for x86 use.
+  # Requires nuScenes annotation JSONs at NUSCENES_VAL (v1.0-trainval/).
   eval:
     <<: *base
     volumes:
