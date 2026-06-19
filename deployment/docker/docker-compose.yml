@@ -4,30 +4,32 @@
 #
 # Prerequisites:
 #   sudo jetson_clocks          <- lock GPU to max clock BEFORE benchmarking
+#   sudo nvpmodel -m 0          <- set 25W MAXN power mode
 #   docker build -t edgefusion-centerpoint:latest -f deployment/docker/Dockerfile .
 #
 # Usage:
 #   docker compose -f deployment/docker/docker-compose.yml run --rm dev
 #   docker compose -f deployment/docker/docker-compose.yml run --rm build-engines
-#   VARIANT=pruned25 docker compose ... run --rm benchmark
-#   VARIANT=pruned25 docker compose ... run --rm eval
+#   VARIANT=qat_best docker compose ... run --rm benchmark
+#   VARIANT=qat_best docker compose ... run --rm infer
+#   docker compose -f deployment/docker/docker-compose.yml run --rm parity-test
+#   VARIANT=qat_best docker compose ... run --rm infer-cuda
 #
 # Volumes:
 #   onnx/      — compression/results/onnx_export/{variant}/*.onnx (read-only)
-#   calib/     — jetson_calib/ (512 raw .pcd.bin point clouds)
-#   calib_bev/ — jetson_calib_bev/ (512 precomputed [64,512,512] BEV .npy
-#                tensors, generated on pod via compression/generate_calib_bev.py)
-#   output/    — built .engine files + benchmark/eval results
+#   calib_bev/ — jetson_calib_bev/ (512 × [64,512,512] BEV .npy tensors,
+#                generated on pod via compression/generate_calib_bev.py)
+#   plugins/   — deployment/plugins/ (CUDA postproc .so + Python wrapper)
+#   output/    — built .engine files + benchmark/eval/parity results
 #
 # Note on jetson_clocks: must be run on the HOST before docker run — it
 # affects hardware clocks, not the container environment. The container
 # inherits host clock state. Without it, GPU idles at low clock and
-# latency numbers won't reflect the 15W performance mode.
+# latency numbers won't reflect the 25W MAXN performance mode.
 #
 # Note on tegrastats: mounted from host (/usr/bin/tegrastats) into the
-# benchmark container for power monitoring. No sudo needed — tegrastats reads
-# the INA3221 power rails (VDD_CPU_GPU_CV, VDD_IN) that are accessible
-# to the running user on Jetson.
+# benchmark container for power monitoring. Reads VDD_CPU_GPU_CV + VDD_IN
+# (INA3221 rails, accessible to the running user on Jetson).
 # ============================================================================
 
 name: edgefusion-centerpoint
@@ -48,6 +50,7 @@ x-base: &base
     - ../../jetson_calib:/workspace/calib:ro
     - ../../jetson_calib_bev:/workspace/calib_bev:ro
     - ../scripts:/workspace/scripts:ro
+    - ../plugins:/workspace/plugins:ro
     - ../output:/workspace/output
 
 services:
@@ -64,13 +67,14 @@ services:
 
   # ── Benchmark latency/power for a built engine ────────────────────────────
   # Power monitoring via tegrastats (mounted from host).
-  # Run sudo jetson_clocks on the HOST before benchmarking.
+  # Run sudo jetson_clocks + sudo nvpmodel -m 0 on HOST before benchmarking.
   benchmark:
     <<: *base
     volumes:
       - ../../compression/results/onnx_export:/workspace/onnx:ro
       - ../../jetson_calib_bev:/workspace/calib_bev:ro
       - ../scripts:/workspace/scripts:ro
+      - ../plugins:/workspace/plugins:ro
       - ../output:/workspace/output
       - /usr/bin/tegrastats:/usr/bin/tegrastats:ro
     command: >
@@ -80,20 +84,15 @@ services:
       --iterations ${ITERATIONS:-200}
       --out /workspace/output/benchmark_${VARIANT:-fp32}.json
 
-  # ── On-device mAP/NDS eval ────────────────────────────────────────────────
-  # Requires nuScenes annotation JSONs (v1.0-trainval/, ~400 MB metadata only)
-  # mounted at NUSCENES_VAL. No sensor data (images/lidar) needed for eval.
-  # Also needs nuscenes_infos_val.pkl at VAL_PKL (default: repo root).
-  # ── Inference only: produce submission JSON, no in-container eval ─────────
-  # Lightweight — no NuScenes mount, no NuScenes load (which OOMs Jetson).
-  # This is the Docker phase; compute mAP/NDS afterward on host via
-  # eval_metrics.py. Used by eval_all.sh.
+  # ── Inference only: produce submission JSON (numpy decode) ────────────────
+  # Lightweight — no NuScenes mount. Run eval_metrics.py on host for mAP/NDS.
   infer:
     <<: *base
     volumes:
       - ../../compression/results/onnx_export:/workspace/onnx:ro
       - ../../jetson_calib_bev:/workspace/calib_bev:ro
       - ../scripts:/workspace/scripts:ro
+      - ../plugins:/workspace/plugins:ro
       - ../output:/workspace/output
       - ${VAL_PKL:-../../nuscenes_infos_val.pkl}:/workspace/nuscenes_infos_val.pkl:ro
     command: >
@@ -105,10 +104,55 @@ services:
       --no-eval
       --out /workspace/output/eval_${VARIANT:-fp32}.json
 
+  # ── Inference with CUDA postprocessor (allocation-free hot path) ──────────
+  # Uses CUDA center-head decode (peak finding + box decode on GPU) instead
+  # of the numpy decode in eval.py. Requires libcenter_head_postprocess.so
+  # compiled in deployment/plugins/:
+  #   cd deployment/plugins && nvcc -O3 --use_fast_math -arch=sm_87 \
+  #       -Xcompiler -fPIC -shared center_head_postprocess.cu \
+  #       -o libcenter_head_postprocess.so
+  infer-cuda:
+    <<: *base
+    volumes:
+      - ../../compression/results/onnx_export:/workspace/onnx:ro
+      - ../../jetson_calib_bev:/workspace/calib_bev:ro
+      - ../scripts:/workspace/scripts:ro
+      - ../plugins:/workspace/plugins:ro
+      - ../output:/workspace/output
+      - ${VAL_PKL:-../../nuscenes_infos_val.pkl}:/workspace/nuscenes_infos_val.pkl:ro
+    command: >
+      python3 scripts/eval_cuda.py
+      --engine /workspace/output/engines/${VARIANT:-fp32}/pts_backbone_neck_head.engine
+      --calib-bev /workspace/calib_bev
+      --val-pkl /workspace/nuscenes_infos_val.pkl
+      --so-path /workspace/plugins/libcenter_head_postprocess.so
+      --no-eval
+      --out /workspace/output/eval_cuda_${VARIANT:-fp32}.json
+
+  # ── CUDA parity tests ─────────────────────────────────────────────────────
+  # Verifies CUDA kernels match the numpy reference (eval.py) within 1e-3.
+  # Numpy-only tests (9) always run; CUDA tests (6) require the .so.
+  # Run on host for numpy-only: pytest deployment/plugins/test_parity.py -v -k "not cuda"
+  # Run here for the full suite including CUDA kernel verification.
+  parity-test:
+    <<: *base
+    volumes:
+      - ../../jetson_calib_bev:/workspace/calib_bev:ro
+      - ../scripts:/workspace/scripts:ro
+      - ../plugins:/workspace/plugins:ro
+      - ../output:/workspace/output
+    entrypoint: bash
+    command:
+      - -c
+      - |
+        pip install pytest -q --root-user-action=ignore 2>/dev/null
+        PYTHONPATH=/workspace/scripts \
+        pytest /workspace/plugins/test_parity.py -v -s --tb=short \
+          --junitxml=/workspace/output/parity_results.xml
+
   # ── Full eval (inference + in-container NuScenes eval) ────────────────────
-  # WARNING: the NuScenes eval step OOMs on Jetson Orin Nano (8 GB). Prefer
-  # the `infer` service + host-side eval_metrics.py. Kept for x86 use.
-  # Requires nuScenes annotation JSONs at NUSCENES_VAL (v1.0-trainval/).
+  # WARNING: NuScenes eval step OOMs on Jetson Orin Nano (8 GB). Prefer
+  # `infer` service + host-side eval_metrics.py. Kept for x86 use.
   eval:
     <<: *base
     volumes:
@@ -116,6 +160,7 @@ services:
       - ../../jetson_calib_bev:/workspace/calib_bev:ro
       - ../../jetson_calib:/workspace/calib:ro
       - ../scripts:/workspace/scripts:ro
+      - ../plugins:/workspace/plugins:ro
       - ../output:/workspace/output
       - ${NUSCENES_VAL:-../../data/nuscenes}:/workspace/nuscenes:ro
       - ${VAL_PKL:-../../nuscenes_infos_val.pkl}:/workspace/nuscenes_infos_val.pkl:ro
