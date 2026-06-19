@@ -229,6 +229,10 @@ def main() -> None:
         },
     }
     out_path    = Path(args.out)
+    # Submission named eval_cuda_{variant}_submission.json to stay distinct from
+    # the numpy-decode submission (eval_{variant}_submission.json from eval.py).
+    # Use: cp eval_cuda_*_submission.json eval_*_cuda_submission.json
+    # then eval_metrics.py --variants *_cuda to evaluate without overwriting numpy.
     result_path = out_path.parent / f'{out_path.stem}_submission.json'
     result_path.parent.mkdir(parents=True, exist_ok=True)
     with open(result_path, 'w') as f:

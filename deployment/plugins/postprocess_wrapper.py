@@ -147,19 +147,6 @@ def _load_lib(so_path: str) -> ctypes.CDLL:
     return lib
 
 
-# ── Managed-memory helpers ────────────────────────────────────────────────────
-
-def _alloc_managed(n_bytes: int):
-    """Allocate CUDA managed memory; returns (pycuda DeviceAllocation, numpy view).
-
-    On Jetson Orin (UMA), managed memory is accessible from both CPU and GPU
-    without explicit cudaMemcpy after stream synchronization.
-    """
-    buf = cuda.managed_zeros(n_bytes, dtype=np.uint8,
-                             mem_flags=cuda.mem_attach_flags.GLOBAL)
-    return buf
-
-
 # ── Circle NMS (CPU, small array) ─────────────────────────────────────────────
 
 def _circle_nms(xy: np.ndarray, scores: np.ndarray, radius: float) -> np.ndarray:
@@ -222,27 +209,22 @@ class CenterHeadPostprocessor:
         self.score_threshold = score_threshold
         self.pool_radius     = pool_radius
 
-        # Pre-allocate managed output buffers (zero-copy on Jetson UMA)
-        # peaks:     [max_det, 3] int32   — (row, col, class_id)
-        # scores:    [max_det]   float32
-        # counts:    [1]        int32
-        # boxes:     [max_det, 10] float32
-        self._peaks_buf  = cuda.managed_zeros(
-            max_detections * 3, dtype=np.int32,
-            mem_flags=cuda.mem_attach_flags.GLOBAL
-        )
-        self._scores_buf = cuda.managed_zeros(
-            max_detections, dtype=np.float32,
-            mem_flags=cuda.mem_attach_flags.GLOBAL
-        )
-        self._counts_buf = cuda.managed_zeros(
-            1, dtype=np.int32,
-            mem_flags=cuda.mem_attach_flags.GLOBAL
-        )
-        self._boxes_buf  = cuda.managed_zeros(
-            max_detections * 10, dtype=np.float32,
-            mem_flags=cuda.mem_attach_flags.GLOBAL
-        )
+        # Pre-allocate GPU output buffers (cuda.mem_alloc — device memory).
+        # cuda.managed_zeros was tried first but segfaults when a TRT engine
+        # occupies the CUDA context; plain device allocation is more robust.
+        # All buffers are pre-allocated once here; the hot path does no
+        # allocation per frame.
+        self._peaks_gpu  = cuda.mem_alloc(max_detections * 3 * 4)   # int32
+        self._scores_gpu = cuda.mem_alloc(max_detections * 4)        # float32
+        self._counts_gpu = cuda.mem_alloc(4)                         # int32 [1]
+        self._boxes_gpu  = cuda.mem_alloc(max_detections * 10 * 4)  # float32
+
+        # Pre-allocated CPU arrays for reading results after dtoh copy.
+        # The copy is ~170 KB total — negligible latency.
+        self._peaks_cpu  = np.zeros(max_detections * 3, dtype=np.int32)
+        self._scores_cpu = np.zeros(max_detections,     dtype=np.float32)
+        self._counts_cpu = np.zeros(1,                  dtype=np.int32)
+        self._boxes_cpu  = np.zeros(max_detections * 10, dtype=np.float32)
 
     # ── Hot path ──────────────────────────────────────────────────────────────
 
@@ -259,18 +241,16 @@ class CenterHeadPostprocessor:
             are queued behind the engine on the same stream, so no explicit
             synchronization is needed between them.
         """
-        # Reset the atomic count to 0 before peak finding.
-        # Direct numpy assignment works on Jetson UMA managed memory:
-        # the CPU write is immediately visible to GPU kernels queued on
-        # the stream AFTER this point (CUDA stream ordering guarantees this).
-        self._counts_buf[0] = 0
+        # Reset the atomic count to 0 via a tiny host-to-device copy.
+        # Plain numpy write to _counts_cpu then htod is safe regardless of
+        # CUDA context state (no managed-memory assumptions).
+        self._counts_cpu[0] = 0
+        cuda.memcpy_htod_async(self._counts_gpu, self._counts_cpu, stream)
 
-        # .ctypes.data gives the raw pointer address (int) for a managed
-        # numpy array — valid on both CPU and GPU on Jetson's UMA.
-        peaks_ptr  = self._peaks_buf.ctypes.data
-        scores_ptr = self._scores_buf.ctypes.data
-        counts_ptr = self._counts_buf.ctypes.data
-        boxes_ptr  = self._boxes_buf.ctypes.data
+        peaks_ptr  = int(self._peaks_gpu)
+        scores_ptr = int(self._scores_gpu)
+        counts_ptr = int(self._counts_gpu)
+        boxes_ptr  = int(self._boxes_gpu)
 
         stream_handle = ctypes.c_void_p(stream.handle)
 
@@ -314,20 +294,24 @@ class CenterHeadPostprocessor:
         # caller must call stream.synchronize() before collect_detections()
 
     def collect_detections(self) -> List[dict]:
-        """Read managed-memory results and apply per-class circle NMS.
+        """Copy GPU results to CPU and apply per-class circle NMS.
 
-        Must be called AFTER stream.synchronize().  Returns a list of
-        detection dicts in nuScenes submission format, matching exactly
-        what eval.py's decode_outputs() produces.
+        Must be called AFTER stream.synchronize().  Copies ~170 KB of result
+        data from GPU to pre-allocated CPU arrays (negligible latency), then
+        applies per-class top-K + circle NMS on CPU.
         """
-        n = int(min(self._counts_buf[0], self.max_det))
+        cuda.memcpy_dtoh(self._counts_cpu, self._counts_gpu)
+        n = int(min(self._counts_cpu[0], self.max_det))
         if n == 0:
             return []
 
-        # View managed memory as numpy arrays — zero-copy on Jetson UMA
-        peaks  = np.array(self._peaks_buf[:n * 3]).reshape(n, 3)   # (row,col,cls)
-        scores = np.array(self._scores_buf[:n])
-        boxes  = np.array(self._boxes_buf[:n * 10]).reshape(n, 10)
+        cuda.memcpy_dtoh(self._peaks_cpu[:n * 3], self._peaks_gpu)
+        cuda.memcpy_dtoh(self._scores_cpu[:n],    self._scores_gpu)
+        cuda.memcpy_dtoh(self._boxes_cpu[:n * 10], self._boxes_gpu)
+
+        peaks  = self._peaks_cpu[:n * 3].reshape(n, 3)
+        scores = self._scores_cpu[:n]
+        boxes  = self._boxes_cpu[:n * 10].reshape(n, 10)
 
         # Per-class top-K + circle NMS (CPU, fast: ~100 boxes max per class)
         detections = []
@@ -376,14 +360,18 @@ class CenterHeadPostprocessor:
     def raw_peaks(self, n: int) -> np.ndarray:
         """Return the first n peak records as (row, col, class_id) array.
         Call AFTER stream.synchronize()."""
-        return np.array(self._peaks_buf[:n * 3]).reshape(n, 3)
+        cuda.memcpy_dtoh(self._peaks_cpu[:n * 3], self._peaks_gpu)
+        return self._peaks_cpu[:n * 3].reshape(n, 3).copy()
 
     def raw_scores(self, n: int) -> np.ndarray:
-        return np.array(self._scores_buf[:n])
+        cuda.memcpy_dtoh(self._scores_cpu[:n], self._scores_gpu)
+        return self._scores_cpu[:n].copy()
 
     def raw_boxes(self, n: int) -> np.ndarray:
-        return np.array(self._boxes_buf[:n * 10]).reshape(n, 10)
+        cuda.memcpy_dtoh(self._boxes_cpu[:n * 10], self._boxes_gpu)
+        return self._boxes_cpu[:n * 10].reshape(n, 10).copy()
 
     @property
     def n_detected(self) -> int:
-        return int(min(self._counts_buf[0], self.max_det))
+        cuda.memcpy_dtoh(self._counts_cpu, self._counts_gpu)
+        return int(min(self._counts_cpu[0], self.max_det))
