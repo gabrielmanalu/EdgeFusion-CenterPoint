@@ -129,36 +129,57 @@ targeted — bicycle and construction_vehicle — show **no change**.
 ### Jetson Deployment Results (Orin Nano 8GB, 25W, TRT 10.3.0)
 
 All variants benchmarked on Jetson Orin Nano Super (JetPack R36.4.0, TRT 10.3.0)
-with `jetson_clocks` locked, on the **25W** power mode. Power via tegrastats
-VDD_CPU_GPU_CV (CPU+GPU+CV rail, inference-relevant) and VDD_IN (total module).
-Latency is the backbone+neck+head engine (FP32 encoder engine adds negligible
-time). On-device mAP/NDS are measured on a **512-sample** subset of the nuScenes
-val set (see "On-device accuracy" note below).
+with `jetson_clocks` locked, **25W** power mode. Power via tegrastats VDD_IN
+(total module). On-device mAP/NDS measured on a **512-sample** subset of the
+nuScenes val set (see "On-device accuracy" note below).
 
-| Variant | Quant method | Engine | p50 latency | FPS | VDD_IN | mJ/frame | on-device mAP | on-device NDS | A40 mAP (ref) |
+**Engine-only latency** (backbone+neck+head TRT engine, measured with CUDA events):
+
+| Variant | Quant method | Engine | p50 | FPS | VDD_IN | mJ/frame | on-device mAP | on-device NDS | A40 mAP (ref) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| **QAT INT8** (recommended) | QAT + explicit Q/DQ | 13.29 MB | 25.70ms | 38.9 | 19.87W | 257.8 | **0.4265** | **0.4804** | 0.4814 |
+| **QAT INT8** (deployed) | QAT + explicit Q/DQ | 13.29 MB | 25.70ms | 38.9 | 19.87W | 257.8 | **0.4265** | **0.4804** | 0.4814 |
 | FP32 → TRT INT8 | PTQ (minmax) | 6.82 MB | 8.09ms | 123.5 | 16.60W | 63.5 | 0.3612 | 0.4304 | 0.4815 |
 | Pruned 25% → TRT INT8 | PTQ (minmax) | 4.90 MB | 7.46ms | 134.1 | 16.41W | 57.9 | 0.2637 | 0.3714 | 0.4081 |
 | Pruned 40% → TRT INT8 | PTQ (minmax) | 4.35 MB | 8.17ms | 122.3 | 15.81W | 60.0 | 0.1176 | 0.1930 | 0.2838 |
 | Pruned 55% → TRT INT8 | PTQ (minmax) | 3.44 MB | 6.93ms | 144.3 | 15.61W | 49.3 | 0.1556 | 0.2267 | 0.2149 |
 | Distilled 25% → TRT INT8 | PTQ (minmax) | 4.92 MB | 7.46ms | 134.1 | 16.38W | 57.7 | 0.2599 | 0.3579 | 0.4094 |
 
-**Recommended deployment: QAT INT8 (0.4265 mAP / 0.4804 NDS on-device, 25.70ms,
-19.87W VDD_IN on the 25W mode).** At 25.70ms it runs comfortably within the
-10–20Hz real-time LiDAR budget (50–100ms per frame), with the full frame budget
-left for voxelization, decode, and ROS2 messaging. This is the only configuration
-that recovers near-FP32 accuracy on-device.
+**End-to-end pipeline** (BEV htod → engine → CUDA postproc → dtoh + NMS, QAT only):
+
+| Stage | p50 | p99 | jitter (p99−p50) |
+| --- | --- | --- | --- |
+| TRT engine (engine-only benchmark) | 25.70ms | 28.08ms | 2.38ms |
+| + BEV htod + CUDA postproc kernels | 29.37ms | 38.76ms | 9.39ms |
+| + dtoh + circle NMS (CPU) | +4.88ms | +4.88ms | — |
+| **Total pipeline** | **34.12ms** | **43.93ms** | **9.82ms** |
+
+Power (total pipeline, 25W MAXN): **16.29W VDD_IN / 566.78 mJ/frame**
+
+![End-to-end pipeline breakdown](deployment/results/pipeline_breakdown.png)
+
+**Recommended deployment: QAT INT8, 25W mode.**
+On-device mAP 0.4265 (near-FP32 ceiling of 0.432), total pipeline p50=34.12ms /
+p99=43.93ms, 16.29W VDD_IN. Fits the 10–20Hz LiDAR real-time budget comfortably —
+34ms uses 68% of the 20Hz (50ms) frame period even at median, and the p99 at 43.93ms
+also clears it. This is the only configuration that recovers near-FP32 accuracy
+on-device; see the sections below and
+[`deployment/README.md`](deployment/README.md) for the full investigation.
 
 #### Real-time target: latency vs LiDAR rate, not raw FPS
 
 nuScenes LiDAR (Velodyne HDL-32E) runs at **20Hz**; most automotive LiDAR is
 10–20Hz, and Autoware's standard perception target is **10Hz** (100ms/frame). The
 deployment-relevant question is not "how many FPS" but "does inference complete
-within one LiDAR frame period." Every variant — including the 25.70ms QAT engine —
-clears the 10Hz budget with margin, and all but QAT also clear 20Hz. The FPS
-column is a throughput metric useful for *comparing variants*, not the deployment
-constraint.
+within one LiDAR frame period."
+
+| Budget | Headroom (vs p50) | Headroom (vs p99) |
+| --- | --- | --- |
+| 10Hz (100ms) | 65.9ms (65%) | 56.1ms (56%) |
+| 20Hz  (50ms) | 15.9ms (32%) | 6.1ms (12%) |
+
+The FPS columns in the engine-only table are throughput metrics for
+*comparing variants*, not deployment constraints. The e2e pipeline number (28.7 FPS
+at the p50 total latency) is the accurate deployment throughput.
 
 #### On-device accuracy: 512-sample subset vs A40 full-val (6019)
 
@@ -189,16 +210,18 @@ calibration-data debugging saga that preceded these numbers, is in
 
 #### Why QAT INT8 is slower than PTQ INT8 (and needs 25W)
 
-The QAT engine is 3× slower than PTQ INT8 (25.70ms vs 8.09ms) despite the same
-architecture. QAT (via `torch.ao.quantization`) exports ONNX with explicit
+The QAT engine is 3× slower than PTQ INT8 (25.70ms vs 8.09ms engine-only) despite
+the same architecture. QAT (via `torch.ao.quantization`) exports ONNX with explicit
 `QuantizeLinear`/`DequantizeLinear` (Q/DQ) nodes, which TensorRT runs through its
 *explicit-quantization* path. That path honors the Q/DQ graph but **blocks the
 Conv+BN+ReLU layer fusion** that PTQ INT8 relies on — each layer becomes a separate
-kernel launch with dtype conversions, hence the latency and the higher power
-(19.87W VDD_IN, within the 25W envelope but above 15W). The accuracy benefit of QAT
-is real; making it *also* fast would require NVIDIA's `pytorch-quantization` toolkit
-(TRT-fusion-aware Q/DQ placement) instead of `torch.ao.quantization` — documented as
-future work.
+kernel launch with dtype conversions, hence the latency (and the remaining 9.82ms
+end-to-end jitter, which also originates in this TRT path). The accuracy benefit of
+QAT is real; making it *also* fast would require NVIDIA's `pytorch-quantization`
+toolkit (TRT-fusion-aware Q/DQ placement) instead of `torch.ao.quantization` —
+documented as future work. The CUDA postprocessing stage (custom peak-finding and
+box-decode kernels, Week 15-18) adds only ~3.7ms to the engine latency, and the
+vectorized circle NMS adds ~4.9ms, for a total of 34.12ms end-to-end.
 
 #### Why pruning does not help latency
 
@@ -260,10 +283,20 @@ EdgeFusion-CenterPoint/
 │   ├── docker/
 │   │   ├── Dockerfile        ← l4t-jetpack:r36.4.0, TRT 10.3.0
 │   │   └── docker-compose.yml← build-engines / benchmark / infer / eval / dev
+│   ├── plugins/
+│   │   ├── center_head_postprocess.h    ← CUDA center-head postproc interface
+│   │   ├── center_head_postprocess.cu   ← peak_finding + box_decode kernels
+│   │   ├── CMakeLists.txt    ← builds libcenter_head_postprocess.so (sm_87)
+│   │   ├── postprocess_wrapper.py       ← ctypes Python interface
+│   │   └── test_parity.py    ← 15 parity tests (9 numpy + 6 CUDA)
+│   ├── results/
+│   │   └── pipeline_breakdown.png       ← e2e latency breakdown chart
 │   ├── scripts/
 │   │   ├── build_engine.py   ← ONNX → TRT (PTQ entropy/minmax, QAT Q/DQ, FP16)
-│   │   ├── benchmark.py      ← CUDA-event latency + tegrastats power
-│   │   ├── eval.py           ← engine → decode → submission JSON (in-container)
+│   │   ├── benchmark.py      ← engine-only CUDA event latency + tegrastats power
+│   │   ├── benchmark_e2e.py  ← full pipeline latency (engine + postproc + NMS)
+│   │   ├── eval.py           ← engine → numpy decode → submission JSON
+│   │   ├── eval_cuda.py      ← engine → CUDA decode → submission JSON
 │   │   ├── eval_metrics.py   ← submission JSON → mAP/NDS via nuscenes-devkit (host)
 │   │   └── eval_all.sh       ← batch all variants
 │   └── README.md             ← deployment journey, findings, and all commands

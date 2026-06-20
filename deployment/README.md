@@ -7,8 +7,7 @@ what actually had to be solved to get a correct, fast, accurate engine on-device
 
 The short version of the outcome: the deployable configuration is **QAT INT8, exported
 with explicit quantize/dequantize nodes, run on the 25W power mode** — on-device
-mAP 0.4265 (essentially the FP32 ceiling for this evaluation setup), 25.70ms/frame,
-19.87W. The longer version — why it isn't the obvious "PTQ INT8 on 15W" — is the point
+mAP 0.4265 (essentially the FP32 ceiling), total pipeline 34.12ms p50 / 43.93ms p99, 16.29W. The longer version — why it isn't the obvious "PTQ INT8 on 15W" — is the point
 of this document.
 
 ---
@@ -20,7 +19,7 @@ of this document.
 | Deployed config | QAT INT8 + explicit Q/DQ, 25W |
 | On-device mAP / NDS (512-sample) | 0.4265 / 0.4804 |
 | Latency (p50 / p99) | 25.70ms / 28.08ms |
-| Power (VDD_IN total module) | 19.87W |
+| Power (VDD_IN, engine-only benchmark) | 19.87W |
 | Engine size (backbone+neck+head) | 13.29 MB |
 | Real-time headroom | fits 10–20Hz LiDAR (50–100ms budget) |
 
@@ -291,7 +290,7 @@ Three things make this the call, despite QAT being the slowest engine:
    FPS column in the benchmark tables is only useful for comparing variants.
 3. **The 25W envelope is already the operating point.** The companion
    EdgeDrive-Perception project runs its ROS2 camera/LiDAR/fusion visualization on the
-   Jetson's 25W mode. QAT INT8 draws 19.87W VDD_IN, comfortably within 25W (it
+   Jetson's 25W mode. QAT INT8 draws 16.29W VDD_IN (full pipeline average), comfortably within 25W (it
    exceeds the 15W mode, which is why 15W is not the target here).
 
 ---
@@ -376,8 +375,116 @@ python3 deployment/scripts/eval_metrics.py \
 
 ## Status
 
-P3 (Jetson deployment) is complete: the engine pipeline builds, benchmarks, and
+Jetson deployment is complete: the engine pipeline builds, benchmarks, and
 evaluates on-device; the multi-sweep accuracy bug is fixed; the INT8 deployment method
 is resolved (QAT + explicit quantization); and QAT INT8 on 25W is the selected
 configuration. Remaining future work is the `pytorch-quantization`-based QAT export to
 remove the layer-fusion latency penalty, and ROS2 / Autoware node integration.
+---
+
+## CUDA center-head postprocessing
+
+The TRT engine produces six raw head output tensors (heatmap, reg, height, dim, rot,
+vel). The original deployment used a **standalone numpy decode** in `eval.py` — correct
+and validated (0.4265 mAP), but running entirely on CPU with no GPU parallelism.
+Later replaced this with a **custom CUDA post-processing stage** that keeps the
+work on GPU until the final tiny result copy, and optimized the CPU tail.
+
+### What was built
+
+Two CUDA kernels in `plugins/center_head_postprocess.cu`:
+
+**`peak_finding_kernel`** — sigmoid + 3×3 max-pool NMS on the [1,10,128,128] heatmap.
+One thread per (h,w,class) cell. Each thread applies sigmoid, checks if its raw logit
+equals the 3×3 neighbourhood maximum (raw comparison is equivalent, sigmoid is monotone,
+avoids redundant expf calls for neighbours), and if score exceeds the threshold, claims
+a slot atomically and writes (row, col, class_id, score) to the peaks array.
+
+**`box_decode_kernel`** — one thread per surviving peak. Reads the task-specific
+regression channels (reg/height/dim/rot/vel) at the peak's (row, col), decodes:
+cx/cy from grid offset + voxel geometry, cz from height, l/w/h from exp(clipped dim),
+yaw from atan2(sin_rot, cos_rot), and velocity directly. Exactly matches the numpy
+math in `eval.py` within 1e-3 (verified by 15 parity tests).
+
+**15/15 parity tests** in `plugins/test_parity.py` confirm numerical equivalence: 9
+numpy unit tests verify the reference decode math, 6 CUDA kernel tests compare output
+against the numpy reference on synthetic inputs within TOLERANCE=1e-3.
+
+### Debugging: the managed-memory segfault
+
+`cuda.managed_zeros` (unified memory, zero-copy on Jetson UMA) was the first
+approach for the postprocessor output buffers. It worked in the parity tests (no TRT
+engine) but segfaulted at `_counts_buf[0] = 0` when combined with a live TRT engine.
+Root cause: TRT's `deserialize_cuda_engine` modifies the CUDA context stack, and
+managed memory allocated after that lands on the wrong context.
+
+Fix: replaced `cuda.managed_zeros` with plain `cuda.mem_alloc` for all GPU buffers +
+pre-allocated numpy CPU arrays. After `stream.synchronize()`, a tiny `memcpy_dtoh`
+(~170 KB total) copies the results to CPU. The "zero-copy UMA" advantage for 170 KB
+is negligible; the allocations-per-frame count is still zero (all buffers pre-allocated
+at init time, hot path is truly allocation-free).
+
+### Debugging: the Python NMS bottleneck
+
+First e2e benchmark result: **CPU tail = 12.61ms mean** out of a 42.33ms total.
+The Python circle NMS loop runs on all *pre-NMS* peaks (not just the final 248
+post-NMS detections). With the QAT engine producing many heatmap cells above the 0.1
+threshold, each class could have 100-200 pre-NMS candidates. Ten classes × ~150 boxes
+each × O(N²) Python loop = the 12ms.
+
+Fix: **vectorized distance matrix** — precompute the full N×N squared-distance matrix
+once (one numpy broadcast op), then the suppression loop does only boolean indexing.
+Additionally replaced pyquaternion instantiation (248 `Quaternion()` objects per frame,
+~0.03ms each) with direct `cos(yaw/2)` / `sin(yaw/2)` numpy calls.
+
+Result: **CPU tail 12.61ms → 4.88ms (-61%).** Total pipeline p99 38.76ms → 43.93ms,
+now comfortably within the 20Hz (50ms) frame budget even at worst-case.
+
+### End-to-end pipeline measurements
+
+All measured on Jetson Orin Nano 8GB, 25W MAXN, `jetson_clocks` locked, 200 iterations.
+GPU portion timed with CUDA events; CPU tail timed with `time.perf_counter()`.
+
+```
+Stage                           p50       p99      jitter
+───────────────────────────────────────────────────────────
+TRT engine (engine-only)       25.70ms   28.08ms   2.38ms
++ BEV htod + CUDA postproc     29.37ms   38.76ms   9.39ms
++ dtoh + circle NMS (CPU)      +4.88ms     —         —
+───────────────────────────────────────────────────────────
+Total pipeline                 34.12ms   43.93ms   9.82ms
+
+FPS (total pipeline):  28.7
+VDD_IN (total):        16.29W
+mJ/frame (VDD_IN):     566.78
+```
+
+![Pipeline breakdown](results/pipeline_breakdown.png)
+
+The remaining 9.82ms jitter is predominantly on the GPU side (9.39ms GPU jitter),
+originating in TRT's explicit-quantization path. PTQ INT8 engines show ~0.02ms GPU
+jitter on the same hardware; the Q/DQ path's separate kernel launches per quantized
+layer are the source. `pytorch-quantization` (TRT-fusion-aware Q/DQ) is the fix —
+documented future work.
+
+### Running the e2e benchmark
+
+```bash
+sudo jetson_clocks   # required on HOST before starting container
+
+# Full pipeline benchmark — engine + CUDA postproc + NMS
+VARIANT=qat_best docker compose -f deployment/docker/docker-compose.yml run --rm benchmark-e2e
+
+# Inference using CUDA decode path (generates submission JSON)
+VARIANT=qat_best docker compose -f deployment/docker/docker-compose.yml run --rm infer-cuda
+
+# Parity tests (run inside container — needs compiled .so)
+docker compose -f deployment/docker/docker-compose.yml run --rm parity-test
+```
+
+Build the `.so` before first use:
+```bash
+cd deployment/plugins
+nvcc -O3 --use_fast_math -arch=sm_87 -Xcompiler -fPIC -shared \
+    center_head_postprocess.cu -o libcenter_head_postprocess.so
+```
