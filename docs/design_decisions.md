@@ -601,3 +601,94 @@ result that actually mattered.
 *Updated: Multi-sweep BEV root cause found and fixed;
 INT8 deployment resolved (entropy → minmax → QAT + explicit quantization);
 QAT INT8 on 25W selected as the deployable configuration.*
+
+## CUDA center-head postprocessing and end-to-end pipeline
+
+The engine-only deployment left the postprocessing in Python/numpy. The
+TRT engine produces raw tensors; the original eval pipeline copied them to CPU and ran
+sigmoid, 3×3 max-pool NMS, box decode, and circle NMS in numpy. We wrote the
+hot path as a custom CUDA stage and measured the complete end-to-end pipeline.
+
+### Design: post-engine CUDA stage, not a TRT plugin
+
+Two options were considered: wrapping the postprocessing as a TRT plugin (`IPluginV2DynamicExt`)
+that runs inside the engine, or as a post-engine CUDA stage that queues kernels on the
+same stream after `execute_async_v3`. The standalone stage was chosen because:
+
+- Simpler implementation (no plugin serialization/registration machinery)
+- Same functional outcome: all GPU work on one stream, no host↔device copies between
+  engine and postproc
+- Equal zero-copy benefit (the output buffers from the engine feed directly into the
+  CUDA kernels as pointers on the same stream)
+- Easier to unit-test independently (the parity test suite runs the kernels without
+  any TRT engine)
+
+### The managed-memory segfault (implementation finding)
+
+`pycuda.driver.managed_zeros` (unified memory, CPU+GPU accessible) was the initial
+approach for postprocessor output buffers, targeting zero-copy result reads on Jetson's
+UMA. It worked in the parity test suite (no TRT engine present) but segfaulted at
+`_counts_buf[0] = 0` when combined with a live TRT engine.
+
+Root cause: TRT's `deserialize_cuda_engine` pushes/pops the CUDA context stack. Managed
+memory allocated *after* this lands on a different context state than the one pycuda's
+autoinit established, causing the CPU access to be invalid. The parity tests avoided
+this because the postprocessor was created at module import time, before any engine
+existed.
+
+Fix: use plain `cuda.mem_alloc` (device memory) for all GPU output buffers. After
+`stream.synchronize()`, copy results with `cuda.memcpy_dtoh` — the total copy is
+~170 KB (peaks + scores + counts + boxes at 3000 max detections), which takes
+microseconds and is negligible. All buffers remain pre-allocated from `__init__`; the
+hot loop does zero Python-side allocations.
+
+### The NMS bottleneck (optimization finding)
+
+First end-to-end benchmark showed a **12.61ms CPU tail** (dtoh + circle NMS) out of a
+42.33ms total pipeline, despite the decode work having moved to GPU. The GPU portion
+was 29.37ms; the CPU was 30% of the total latency and the dominant source of jitter.
+
+Root cause: circle NMS runs on all *pre-NMS* peak candidates, not just the final
+post-NMS detections. The QAT engine produces many heatmap cells above the 0.1
+score threshold (the 512×512 grid with a 0.1 sigmoid floor allows many to survive).
+The Python NMS loop with a O(N²) per-class structure ran on ~100-200 boxes per class
+× 10 classes. Additionally, `pyquaternion.Quaternion()` was being instantiated for each
+of the final ~248 detections per frame (~0.03ms/object, ~7ms total).
+
+Fix 1 — **vectorized NMS**: precompute the full N×N squared-distance matrix once
+(one numpy broadcast operation: `(xy[:, None, :] - xy[None, :, :]) ** 2).sum(2)`),
+then the suppression loop does only boolean indexing on the precomputed matrix. For
+N~150 per class, this eliminates the per-pair sqrt and the O(N²) numpy-per-pair
+overhead.
+
+Fix 2 — **direct quaternion**: replaced `Quaternion(axis=[0,0,1], angle=yaw)` with
+direct `w = cos(yaw/2)`, `z = sin(yaw/2)` numpy calls. pyquaternion's constructor
+performs matrix operations; 248 instantiations per frame is measurable overhead.
+
+Result: CPU tail **12.61ms → 4.88ms (-61%)**.
+
+### Final end-to-end pipeline measurements (200 iterations, 25W MAXN)
+
+```
+Stage                              p50       p99      jitter
+────────────────────────────────────────────────────────────
+TRT engine (engine-only)          25.70ms   28.08ms   2.38ms
++ BEV htod + CUDA kernels         29.37ms   38.76ms   9.39ms
++ dtoh + circle NMS (CPU)         +4.88ms    —         —
+────────────────────────────────────────────────────────────
+Total pipeline                    34.12ms   43.93ms   9.82ms
+
+FPS: 28.7    VDD_IN: 16.29W    mJ/frame: 566.78
+```
+
+Real-time assessment: p50=34.12ms gives 15.9ms headroom to the 20Hz (50ms) budget.
+p99=43.93ms also clears 20Hz. At 10Hz (100ms) there is 65ms of headroom.
+
+The remaining 9.82ms jitter is almost entirely GPU-side (9.39ms). Its source is
+TRT's explicit-quantization path producing variable-length kernel execution sequences
+per frame — PTQ INT8 on the same engine architecture shows ~0.02ms GPU jitter. The fix
+(future work) is `pytorch-quantization`'s TRT-fusion-aware Q/DQ placement, which would
+let TRT fuse through Q/DQ nodes and restore the fast, low-jitter INT8 path.
+
+*Updated: Jetson deployment complete including CUDA postprocessing,
+NMS optimization, and end-to-end pipeline measurement.*

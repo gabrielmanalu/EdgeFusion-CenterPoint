@@ -220,7 +220,7 @@ end-to-end jitter, which also originates in this TRT path). The accuracy benefit
 QAT is real; making it *also* fast would require NVIDIA's `pytorch-quantization`
 toolkit (TRT-fusion-aware Q/DQ placement) instead of `torch.ao.quantization` —
 documented as future work. The CUDA postprocessing stage (custom peak-finding and
-box-decode kernels, Week 15-18) adds only ~3.7ms to the engine latency, and the
+box-decode kernels) adds only ~3.7ms to the engine latency, and the
 vectorized circle NMS adds ~4.9ms, for a total of 34.12ms end-to-end.
 
 #### Why pruning does not help latency

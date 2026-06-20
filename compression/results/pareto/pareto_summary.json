@@ -10,7 +10,11 @@
       "trt_engine_pct": 100.0,
       "jetson_latency_ms": 8.09,
       "jetson_vddin_w": 16.6,
-      "jetson_map512": 0.3612
+      "jetson_map512": 0.3612,
+      "e2e_p50_ms": 16.64,
+      "e2e_p99_ms": 18.14,
+      "e2e_vddin_w": 16.6,
+      "e2e_measured": false
     },
     {
       "name": "PTQ INT8",
@@ -22,7 +26,11 @@
       "trt_engine_pct": 100.0,
       "jetson_latency_ms": 8.09,
       "jetson_vddin_w": 16.6,
-      "jetson_map512": 0.3612
+      "jetson_map512": 0.3612,
+      "e2e_p50_ms": 16.64,
+      "e2e_p99_ms": 18.14,
+      "e2e_vddin_w": 16.6,
+      "e2e_measured": false
     },
     {
       "name": "QAT INT8",
@@ -34,7 +42,11 @@
       "trt_engine_pct": 194.9,
       "jetson_latency_ms": 25.7,
       "jetson_vddin_w": 19.87,
-      "jetson_map512": 0.4265
+      "jetson_map512": 0.4265,
+      "e2e_p50_ms": 34.12,
+      "e2e_p99_ms": 43.93,
+      "e2e_vddin_w": 16.29,
+      "e2e_measured": true
     },
     {
       "name": "Pruned 25%",
@@ -46,7 +58,11 @@
       "trt_engine_pct": 71.85,
       "jetson_latency_ms": 7.46,
       "jetson_vddin_w": 16.41,
-      "jetson_map512": 0.2637
+      "jetson_map512": 0.2637,
+      "e2e_p50_ms": 14.629999999999999,
+      "e2e_p99_ms": 16.13,
+      "e2e_vddin_w": 16.41,
+      "e2e_measured": false
     },
     {
       "name": "Pruned 40%",
@@ -58,7 +74,11 @@
       "trt_engine_pct": 63.78,
       "jetson_latency_ms": 8.17,
       "jetson_vddin_w": 15.81,
-      "jetson_map512": 0.1176
+      "jetson_map512": 0.1176,
+      "e2e_p50_ms": 15.34,
+      "e2e_p99_ms": 16.84,
+      "e2e_vddin_w": 15.81,
+      "e2e_measured": false
     },
     {
       "name": "Pruned 55%",
@@ -70,7 +90,11 @@
       "trt_engine_pct": 50.44,
       "jetson_latency_ms": 6.93,
       "jetson_vddin_w": 15.61,
-      "jetson_map512": 0.1556
+      "jetson_map512": 0.1556,
+      "e2e_p50_ms": 14.1,
+      "e2e_p99_ms": 15.6,
+      "e2e_vddin_w": 15.61,
+      "e2e_measured": false
     }
   ],
   "architecture_pareto_front": [
@@ -108,34 +132,40 @@
   "ondevice_pareto_front": [
     {
       "name": "Pruned 55%",
-      "latency_ms": 6.93,
+      "e2e_p50_ms": 14.1,
       "map512": 0.1556,
-      "vddin_w": 15.61
+      "e2e_measured": false
     },
     {
       "name": "Pruned 25%",
-      "latency_ms": 7.46,
+      "e2e_p50_ms": 14.629999999999999,
       "map512": 0.2637,
-      "vddin_w": 16.41
+      "e2e_measured": false
     },
     {
       "name": "FP32 baseline",
-      "latency_ms": 8.09,
+      "e2e_p50_ms": 16.64,
       "map512": 0.3612,
-      "vddin_w": 16.6
+      "e2e_measured": false
     },
     {
       "name": "PTQ INT8",
-      "latency_ms": 8.09,
+      "e2e_p50_ms": 16.64,
       "map512": 0.3612,
-      "vddin_w": 16.6
+      "e2e_measured": false
     },
     {
       "name": "QAT INT8",
-      "latency_ms": 25.7,
+      "e2e_p50_ms": 34.12,
       "map512": 0.4265,
-      "vddin_w": 19.87
+      "e2e_measured": true
     }
   ],
+  "budget_constraints": {
+    "map_min": 0.4,
+    "p99_max_ms": 50.0,
+    "power_max_w": 25.0
+  },
+  "operating_point": "QAT INT8",
   "fp32_engine_mb": 6.82
 }
