@@ -4,7 +4,7 @@
 #
 # Prerequisites:
 #   sudo jetson_clocks          <- lock GPU to max clock BEFORE benchmarking
-#   sudo nvpmodel -m 0          <- set 25W MAXN power mode
+#   sudo nvpmodel -m 1          <- set 25W power mode
 #   docker build -t edgefusion-centerpoint:latest -f deployment/docker/Dockerfile .
 #
 # Usage:
@@ -25,7 +25,7 @@
 # Note on jetson_clocks: must be run on the HOST before docker run — it
 # affects hardware clocks, not the container environment. The container
 # inherits host clock state. Without it, GPU idles at low clock and
-# latency numbers won't reflect the 25W MAXN performance mode.
+# latency numbers won't reflect the 25W performance mode.
 #
 # Note on tegrastats: mounted from host (/usr/bin/tegrastats) into the
 # benchmark container for power monitoring. Reads VDD_CPU_GPU_CV + VDD_IN
@@ -67,7 +67,7 @@ services:
 
   # ── Benchmark latency/power for a built engine ────────────────────────────
   # Power monitoring via tegrastats (mounted from host).
-  # Run sudo jetson_clocks + sudo nvpmodel -m 0 on HOST before benchmarking.
+  # Run sudo jetson_clocks + sudo nvpmodel -m 1 on HOST before benchmarking.
   benchmark:
     <<: *base
     volumes:
@@ -171,6 +171,28 @@ services:
       --val-pkl /workspace/nuscenes_infos_val.pkl
       --nuscenes /workspace/nuscenes
       --out /workspace/output/eval_${VARIANT:-fp32}.json
+
+  # ── End-to-end pipeline benchmark (engine + CUDA postproc) ─────────────────
+  # Times the complete hot path: BEV htod → TRT engine → CUDA peak_finding
+  # → CUDA box_decode → result dtoh → circle NMS. Reports p50/p99/jitter
+  # for the GPU portion and the CPU tail separately.
+  # Requires libcenter_head_postprocess.so built in deployment/plugins/.
+  benchmark-e2e:
+    <<: *base
+    volumes:
+      - ../../compression/results/onnx_export:/workspace/onnx:ro
+      - ../../jetson_calib_bev:/workspace/calib_bev:ro
+      - ../scripts:/workspace/scripts:ro
+      - ../plugins:/workspace/plugins:ro
+      - ../output:/workspace/output
+      - /usr/bin/tegrastats:/usr/bin/tegrastats:ro
+    command: >
+      python3 scripts/benchmark_e2e.py
+      --engine /workspace/output/engines/${VARIANT:-qat_best}/pts_backbone_neck_head.engine
+      --calib-bev /workspace/calib_bev
+      --so-path /workspace/plugins/libcenter_head_postprocess.so
+      --iterations ${ITERATIONS:-200}
+      --out /workspace/output/benchmark_e2e_${VARIANT:-qat_best}.json
 
   # ── Interactive development shell ─────────────────────────────────────────
   dev:

@@ -47,8 +47,7 @@ from pathlib import Path
 from typing import Dict, List
 
 import numpy as np
-import pycuda.driver as cuda  # needed for managed_zeros, Stream type hint
-from pyquaternion import Quaternion
+import pycuda.driver as cuda  # needed for mem_alloc, Stream type hint
 
 # ── CenterPoint nuScenes constants (must match eval.py) ──────────────────────
 
@@ -150,21 +149,39 @@ def _load_lib(so_path: str) -> ctypes.CDLL:
 # ── Circle NMS (CPU, small array) ─────────────────────────────────────────────
 
 def _circle_nms(xy: np.ndarray, scores: np.ndarray, radius: float) -> np.ndarray:
-    """Greedy circle NMS.  xy: [N,2], scores: [N].  Returns kept indices.
+    """Greedy circle NMS — vectorized numpy.  xy: [N,2], scores: [N].
+    Returns kept indices (into the original unsorted array).
 
-    Identical to _circle_nms() in eval.py — used as the reference in
-    parity tests and as the production NMS after CUDA decode.
+    Precomputes the full N×N squared-distance matrix once (vectorized),
+    then the suppression pass does only boolean indexing — no per-pair
+    sqrt calls in Python.  For N~150 per class this is ~10× faster than
+    the element-wise Python loop used as the eval.py reference.
+
+    The suppression logic is identical to eval.py's _circle_nms, just
+    reordered to exploit numpy broadcasting.
     """
-    order = scores.argsort()[::-1]
-    keep = []
-    suppressed = np.zeros(len(order), dtype=bool)
-    for i, idx in enumerate(order):
+    n = len(scores)
+    if n == 0:
+        return np.array([], dtype=np.int64)
+
+    order = scores.argsort()[::-1]       # descending score order
+    xy_ord = xy[order]                   # reorder once
+
+    # Pairwise squared distances — one vectorized broadcast op
+    diff = xy_ord[:, np.newaxis, :] - xy_ord[np.newaxis, :, :]
+    dist_sq = (diff * diff).sum(2)       # [N, N]
+    radius_sq = radius * radius
+
+    suppressed = np.zeros(n, dtype=bool)
+    keep_idx = []
+    for i in range(n):
         if suppressed[i]:
             continue
-        keep.append(idx)
-        dists = np.sqrt(((xy[order[i + 1:]] - xy[idx]) ** 2).sum(1))
-        suppressed[i + 1:][dists < radius] = True
-    return np.array(keep, dtype=np.int64)
+        keep_idx.append(i)
+        # Suppress all lower-scoring boxes within radius using precomputed matrix
+        suppressed[i + 1:] |= dist_sq[i, i + 1:] < radius_sq
+
+    return order[np.array(keep_idx, dtype=np.int64)]
 
 
 # ── Main class ────────────────────────────────────────────────────────────────
@@ -338,15 +355,20 @@ class CenterHeadPostprocessor:
             for i in keep:
                 cx, cy, cz        = cls_boxes[i, 0], cls_boxes[i, 1], cls_boxes[i, 2]
                 d_len, d_wid, d_hgt = cls_boxes[i, 3], cls_boxes[i, 4], cls_boxes[i, 5]
-                yaw               = cls_boxes[i, 6]
+                yaw               = float(cls_boxes[i, 6])
                 vx, vy            = cls_boxes[i, 7], cls_boxes[i, 8]
 
-                q = Quaternion(axis=[0, 0, 1], angle=float(yaw))
+                # Direct quaternion from yaw (axis=[0,0,1]) — avoids pyquaternion
+                # instantiation overhead (pyquaternion does matrix ops per call).
+                # Quaternion for rotation around Z by yaw:
+                #   w = cos(yaw/2), x = 0, y = 0, z = sin(yaw/2)
+                half = yaw * 0.5
+                q_w, q_z = float(np.cos(half)), float(np.sin(half))
                 detections.append({
                     'translation': [float(cx), float(cy), float(cz)],
                     # nuScenes size = [width, length, height]
                     'size': [float(d_wid), float(d_len), float(d_hgt)],
-                    'rotation': [q.w, q.x, q.y, q.z],
+                    'rotation': [q_w, 0.0, 0.0, q_z],
                     'velocity': [float(vx), float(vy)],
                     'detection_name': cls_name,
                     'detection_score': float(cls_scores[i]),
