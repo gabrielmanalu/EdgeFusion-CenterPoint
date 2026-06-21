@@ -692,3 +692,64 @@ let TRT fuse through Q/DQ nodes and restore the fast, low-jitter INT8 path.
 
 *Updated: Jetson deployment complete including CUDA postprocessing,
 NMS optimization, and end-to-end pipeline measurement.*
+
+## ROS 2 / Autoware integration
+
+### Why `autoware_perception_msgs/DetectedObjects` and not MarkerArray
+
+The node publishes `autoware_perception_msgs/DetectedObjects` rather than a
+raw `visualization_msgs/MarkerArray` because the downstream Autoware stack
+(multi-object tracking, map-based prediction, motion planning) consumes
+`DetectedObjects` directly. Publishing a display format would make the node
+useless to every downstream component that doesn't know how to parse coloured
+boxes. The MarkerArray converter (`scripts/detections_to_markers.py`) is a
+display adapter only — present for visualisation; absent in production.
+
+### Why a standalone CUDA postprocessor, not a TRT plugin
+
+The center-head postprocessor (peak finding + box decode) runs as a standalone
+CUDA `.so` rather than a TRT IPluginV3 registered in the engine. Three reasons:
+
+1. **Engine portability.** A TRT plugin embeds the CUDA kernel into the engine
+   file, tying it to a specific TRT version and CUDA arch. The standalone `.so`
+   can be updated independently of the engine — useful when tuning NMS thresholds
+   or decoding conventions without rebuilding the 13GB QAT engine.
+2. **Managed-memory segfault with TRT context.** When TRT's execution context
+   is active (between `createExecutionContext` and `enqueueV3`), CUDA unified
+   managed memory allocated with `cudaMallocManaged` segfaults on Jetson if
+   the allocation happens *after* the context is created. The standalone postproc
+   allocates managed memory during its own initialisation, which happens before
+   either TRT context is created. Plugging it into the engine would require
+   careful ordering that is fragile across TRT versions.
+3. **Debuggability.** The standalone parity test suite (15 tests, 6 CUDA kernel
+   tests) runs against the `.so` without any TRT dependency, making postproc
+   bugs easy to isolate.
+
+### DDS discovery across Docker containers
+
+ROS 2 Humble's default middleware (Fast DDS) uses multicast for participant
+discovery. On Jetson with JetPack R36.4, multicast between separate `docker run`
+processes on the same host is unreliable — nodes appear in `ros2 node list`
+from within their own container but are invisible to processes in other
+containers, even with `--network host`. Root cause: the kernel's multicast
+routing table does not forward packets across separate container network
+namespaces, and Fast DDS's default discovery profile does not fall back to
+unicast without explicit configuration.
+
+**Fix**: all ROS 2 processes (detection node, bag player, RViz2) must share a
+single persistent container via `docker exec`. This ensures all DDS participants
+are in the same network namespace and discover each other trivially, equivalent
+to running multiple terminals on a bare Linux system.
+
+### Online voxelizer vs pre-computed BEV
+
+The deployment benchmark (`benchmark_e2e.py`) used pre-computed BEV tensors
+to isolate engine latency. The ROS 2 node adds online voxelization
+(CPU, ~4ms for 35k points at 30k×32 max) and pillar scatter (CPU, ~1ms for
+30k×64 features). These account for most of the ~20ms gap between the
+engine-only p50 (25.7ms for QAT) and the node's observed callback latency
+(~90ms) — the remainder is the engine re-warmed without pre-allocated CUDA
+streams in the same process as the postprocessor. This is acceptable for
+demo and integration purposes; for a production-latency-optimised path,
+GPU-side voxelization and persistent CUDA streams across frames would reduce
+the callback time toward the benchmark figure.

@@ -6,6 +6,17 @@
 
 ---
 
+## Demo
+
+> **QAT INT8 · Jetson Orin Nano 8GB · 25W · ~12 Hz · nuScenes mini**
+>
+> Point cloud (height-coloured) + Autoware `DetectedObjects` (class-coloured oriented boxes + velocity arrows)
+> visualised live in RViz2 with `autoware_perception_rviz_plugin`.
+>
+![Demo](docs/demo/demo.gif)
+
+---
+
 INT8-compressed CenterPoint LiDAR 3D detector for real-time autonomous driving inference
 on Jetson Orin Nano 8GB (25W power mode).
 
@@ -50,21 +61,26 @@ the 10–20Hz real-time LiDAR budget. See [`docs/design_decisions.md`](docs/desi
 ├─────────────────────────────────────────────────────────────────────┤
 │  Input: PointCloud2 (nuScenes LIDAR_TOP, 32-beam)                   │
 │                                                                     │
-│  Voxelization → PointPillars encoder → Pillar scatter (512×512 BEV) │
+│  CPU Voxelizer (11-feat pillars, 30k×32 grid)                       │
 │       ↓                                                             │
-│  SECOND backbone  [3 blocks, stride 1/2/2]                          │
-│  SECONDFPN neck   [upsample → 512×512 concat]                       │
+│  pts_voxel_encoder  (TRT INT8)                                      │
+│  Pillar scatter → 64 × 512 × 512 BEV                                │
 │       ↓                                                             │
-│  CenterPoint head [10 classes × 6 regression tasks]                 │
-│  heatmap / reg / height / dim / rot / vel                           │
+│  pts_backbone_neck_head  (TRT INT8)                                 │
+│  SECOND backbone + SECONDFPN neck                                   │
+│  CenterPoint head [10 classes × 6 tasks]                            │
 │       ↓                                                             │
-│  Circle-NMS → DetectedObjects                                       │
+│  CUDA center-head postproc (peak_finding + box_decode)              │
+│  Circle-NMS (CPU, vectorised)                                       │
+│       ↓                                                             │
+│  autoware_perception_msgs/DetectedObjects                           │
+│  → ROS 2 Humble · autoware_perception_rviz_plugin                   │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Compression stack (cloud A40)                                      │
 │  PTQ INT8 → Sensitivity → QAT → Pruning sweep → Distillation        │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Deployment (Jetson Orin Nano 8GB / 25W)                            │
-│  QAT → ONNX (explicit Q/DQ) → TRT INT8 engine → ROS2 → Autoware     │
+│  QAT → ONNX (explicit Q/DQ) → TRT INT8 engine → ROS 2 → Autoware    │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -180,6 +196,24 @@ within one LiDAR frame period."
 The FPS columns in the engine-only table are throughput metrics for
 *comparing variants*, not deployment constraints. The e2e pipeline number (28.7 FPS
 at the p50 total latency) is the accurate deployment throughput.
+
+### Autoware-native integration
+
+The QAT INT8 engine is wrapped as a ROS 2 Humble node that mirrors the
+`autoware_lidar_centerpoint` topic interface — a drop-in replacement requiring
+no changes to downstream tracking, prediction, or planning nodes.
+
+| | |
+|---|---|
+| **Subscribe** | `/sensing/lidar/top/pointcloud_raw_ex` (`sensor_msgs/PointCloud2`) |
+| **Publish** | `/perception/object_recognition/detection/objects` (`autoware_perception_msgs/DetectedObjects`) |
+| **Classes** | car · truck · bus · trailer · motorcycle · bicycle · pedestrian (→ Autoware labels) |
+| **Rate** | ~12 Hz on nuScenes mini sweeps (pipeline-bound; engine alone runs at 28 Hz) |
+| **Visualisation** | `autoware_perception_rviz_plugin/DetectedObjects` — class-coloured oriented boxes + velocity arrows |
+
+See [`ros2_autoware/README.md`](ros2_autoware/README.md) for build and run instructions.
+
+---
 
 #### On-device accuracy: 512-sample subset vs A40 full-val (6019)
 
@@ -300,6 +334,28 @@ EdgeFusion-CenterPoint/
 │   │   ├── eval_metrics.py   ← submission JSON → mAP/NDS via nuscenes-devkit (host)
 │   │   └── eval_all.sh       ← batch all variants
 │   └── README.md             ← deployment journey, findings, and all commands
+├── ros2_autoware/         ← ROS 2 Humble node + Autoware-native integration
+│   ├── include/
+│   │   ├── voxelizer.hpp     ← CPU pillar voxelizer (30k×32×11 features)
+│   │   └── centerpoint_trt.hpp ← full online inference pipeline class
+│   ├── src/
+│   │   ├── voxelizer.cpp
+│   │   ├── centerpoint_trt.cpp  ← voxelize → encoder TRT → scatter → backbone TRT → CUDA postproc → NMS
+│   │   └── lidar_centerpoint_node.cpp ← rclcpp node, PointCloud2 → DetectedObjects
+│   ├── scripts/
+│   │   ├── nuscenes_to_ros2bag.py ← nuScenes mini → .db3 bag (20 Hz LiDAR sweeps)
+│   │   └── detections_to_markers.py ← DetectedObjects → MarkerArray for generic visualisers
+│   ├── config/
+│   │   ├── centerpoint.param.yaml ← engine paths + detection parameters
+│   │   └── foxglove_layout.json   ← Foxglove Studio layout (point cloud + boxes + camera)
+│   ├── launch/
+│   │   └── centerpoint.launch.xml
+│   ├── docker/
+│   │   ├── Dockerfile        ← extends edgedrive-ros2, adds rviz2 + autoware plugin
+│   │   └── docker-compose.yml
+│   ├── CMakeLists.txt
+│   ├── package.xml
+│   └── README.md
 ├── docs/
 │   └── design_decisions.md
 ├── scripts/
@@ -402,7 +458,7 @@ python EdgeFusion-CenterPoint/compression/distillation.py \
 
 Model weights are not stored in this repository.
 
-**Download from Google Drive:** *(link to be added)*
+**Download:** [Dropbox](https://www.dropbox.com/scl/fo/ohdl3hrb4lz664h7r4n1s/AEJgxkvb9o82Wy4DCH36TSM?rlkey=oo1qzjl2b7wtiw4yrv6xis8zc&st=opbzstyx&dl=0)
 
 | File | Description | Size |
 | --- | --- | --- |
@@ -415,7 +471,8 @@ Model weights are not stored in this repository.
 | `pruned_55.pth`, `pruned_model_55.pt` | Pruned 55% | ~5 MB |
 | `distilled_25.pth`, `distilled_model_25.pt` | Distilled (25% arch) | ~14 MB |
 | `onnx_multitask/` | Exported ONNX files (encoder + backbone-neck-head) | 40 MB |
-| `jetson_calib/` | 512 point clouds for TRT INT8 calibration on Jetson | ~200 MB |
+| `engine/` | Exported Engine Files | ~40 MB |
+| `jetson_calib/` | 512 point clouds for TRT INT8 calibration on Jetson | ~360 MB |
 
 The FP32 baseline checkpoint is also available from the
 [open-mmlab model zoo](https://github.com/open-mmlab/mmdetection3d/tree/main/configs/centerpoint).
