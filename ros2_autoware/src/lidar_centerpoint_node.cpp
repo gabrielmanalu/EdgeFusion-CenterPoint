@@ -207,11 +207,11 @@ private:
             obj.kinematics.has_twist = true;
         }
 
-        // Shape
+        // Shape — clamp to 0.1 m minimum
         obj.shape.type = aw::Shape::BOUNDING_BOX;
-        obj.shape.dimensions.x = d.width;   // Autoware x = width
-        obj.shape.dimensions.y = d.length;  // Autoware y = length
-        obj.shape.dimensions.z = d.height;
+        obj.shape.dimensions.x = std::max(0.1, static_cast<double>(d.length));
+        obj.shape.dimensions.y = std::max(0.1, static_cast<double>(d.width));
+        obj.shape.dimensions.z = std::max(0.1, static_cast<double>(d.height));
 
         return obj;
     }
