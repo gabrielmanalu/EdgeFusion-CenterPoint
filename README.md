@@ -319,7 +319,7 @@ EdgeFusion-CenterPoint/
 git clone https://github.com/gabrielmanalu/EdgeFusion-CenterPoint.git \
     /workspace/mmdetection3d/EdgeFusion-CenterPoint
 cd /workspace/mmdetection3d/EdgeFusion-CenterPoint
-bash script/setup_env.sh 2>&1 | tee /workspace/setup_env.log
+bash scripts/setup_env.sh 2>&1 | tee /workspace/setup_env.log
 source /workspace/activate_env.sh
 ```
 

@@ -1,0 +1,38 @@
+<!-- centerpoint.launch.xml
+     Launches the edge_fusion lidar_centerpoint node with a param file.
+
+     Usage:
+       ros2 launch edge_fusion_centerpoint centerpoint.launch.xml \
+         encoder_engine:=/workspace/engines/qat_best/pts_voxel_encoder.engine \
+         backbone_engine:=/workspace/engines/qat_best/pts_backbone_neck_head.engine
+-->
+<launch>
+  <!-- Engine paths — override at launch time -->
+  <arg name="encoder_engine"
+       default="/workspace/data/centerpoint/engines/qat_best/pts_voxel_encoder.engine"/>
+  <arg name="backbone_engine"
+       default="/workspace/data/centerpoint/engines/qat_best/pts_backbone_neck_head.engine"/>
+  <arg name="postproc_so"
+       default="/workspace/plugins/libcenter_head_postprocess.so"/>
+  <arg name="param_file"
+       default="$(find-pkg-share edge_fusion_centerpoint)/config/centerpoint.param.yaml"/>
+
+  <!-- Input / output topics -->
+  <arg name="input_topic"
+       default="/sensing/lidar/top/pointcloud_raw_ex"/>
+  <arg name="output_topic"
+       default="/perception/object_recognition/detection/objects"/>
+
+  <node pkg="edge_fusion_centerpoint"
+        exec="lidar_centerpoint_node"
+        name="lidar_centerpoint"
+        output="screen">
+    <param from="$(var param_file)"/>
+    <!-- Command-line overrides take precedence over param file -->
+    <param name="encoder_engine_path"  value="$(var encoder_engine)"/>
+    <param name="backbone_engine_path" value="$(var backbone_engine)"/>
+    <param name="postproc_so_path"     value="$(var postproc_so)"/>
+    <param name="sub_topic"            value="$(var input_topic)"/>
+    <param name="pub_topic"            value="$(var output_topic)"/>
+  </node>
+</launch>
