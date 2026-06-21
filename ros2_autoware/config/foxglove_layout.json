@@ -1,0 +1,45 @@
+{
+  "configById": {
+    "3d!main": {
+      "cameraState": {
+        "perspective": true,
+        "distance": 35,
+        "phi": 45,
+        "thetaOffset": 0,
+        "targetOffset": [0, 0, 0],
+        "fovy": 0.75,
+        "near": 0.01,
+        "far": 5000
+      },
+      "followTf": "lidar_top",
+      "topics": {
+        "/sensing/lidar/top/pointcloud_raw_ex": {
+          "visible": true,
+          "colorMode": "colormap",
+          "colorField": "z",
+          "colorMap": "turbo",
+          "minValue": -2.0,
+          "maxValue": 3.0,
+          "pointSize": 2
+        },
+        "/perception/markers": {
+          "visible": true
+        }
+      },
+      "layers": {}
+    },
+    "image!camera": {
+      "cameraTopic": "/sensing/camera/front/image_raw",
+      "synchronize": false
+    }
+  },
+  "layout": {
+    "direction": "row",
+    "first": {
+      "direction": "column",
+      "first": "3d!main",
+      "second": "image!camera",
+      "splitPercentage": 72
+    }
+  }
+}
