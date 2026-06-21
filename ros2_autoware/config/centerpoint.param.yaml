@@ -8,7 +8,7 @@
     postproc_so_path:     "/workspace/plugins/libcenter_head_postprocess.so"
 
     # Detection thresholds
-    score_threshold: 0.35
+    score_threshold: 0.50
     nms_radius:      2.0
     max_detections:  500
 
